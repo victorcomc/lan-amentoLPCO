@@ -1,0 +1,23 @@
+# Credenciais e certificado — NUNCA commitar
+.env
+certs/
+
+# Logs
+*.log
+
+# Arquivos temporários de debug (criados durante desenvolvimento)
+find_*.py
+analyze_*.py
+inspect_*.py
+find_*.py
+*.html
+chunk_*.js
+docs_dump.html
+portal_index.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
