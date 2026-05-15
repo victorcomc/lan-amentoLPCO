@@ -108,14 +108,11 @@ def _secret_valido(received: str) -> bool:
 
 
 def _resolver_destinatarios(modelo: str, destinatario_id: str) -> list[str]:
-    """Mapeia modelo de LPCO + cert owner para a lista de destinatários de email."""
+    """Mapeia modelo de LPCO para a lista de destinatários de email."""
     if modelo == MODELO_FRUTA:
         return [config.EMAIL_FRUTA]
     if modelo == MODELO_PESCA:
-        # Se o cert nordeste (Felipe) estiver configurado e este evento é dele → NE
-        if config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID:
-            return [config.EMAIL_PESCA_NE] if config.EMAIL_PESCA_NE else [config.EMAIL_OPERACAO]
-        return [config.EMAIL_PESCA_SE]
+        return [config.EMAIL_PESCA]
     logger.warning("Modelo desconhecido '%s' (destinatario=%s) — usando EMAIL_OPERACAO.", modelo, destinatario_id)
     return [config.EMAIL_OPERACAO]
 

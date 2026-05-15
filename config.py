@@ -27,11 +27,9 @@ class Config:
     # Destinatários — alertas de sistema (falhas, saúde do webhook)
     EMAIL_OPERACAO: str = os.getenv("EMAIL_OPERACAO", "")
     # Destinatários por tipo de LPCO
-    EMAIL_FRUTA: str = os.getenv("EMAIL_FRUTA", "")      # modelo E00144
-    EMAIL_PESCA_SE: str = os.getenv("EMAIL_PESCA_SE", "") # modelo E00061, cert sudeste (Diogenes)
-    EMAIL_PESCA_NE: str = os.getenv("EMAIL_PESCA_NE", "") # modelo E00061, cert nordeste (Felipe)
-    # CPF/CNPJ do titular do cert nordeste (Felipe) — preencher quando disponível
-    # Quando vazio, todo E00061 vai para EMAIL_PESCA_SE
+    EMAIL_FRUTA: str = os.getenv("EMAIL_FRUTA", "")   # modelo E00144
+    EMAIL_PESCA: str = os.getenv("EMAIL_PESCA", "")   # modelo E00061 (sudeste e nordeste)
+    # CPF/CNPJ do titular do cert nordeste (Felipe)
     CERT_NE_OWNER_ID: str = os.getenv("CERT_NE_OWNER_ID", "")
 
     # Webhook receiver
@@ -51,7 +49,7 @@ class Config:
             "SMTP_APP_PASSWORD": self.SMTP_APP_PASSWORD,
             "EMAIL_OPERACAO": self.EMAIL_OPERACAO,
             "EMAIL_FRUTA": self.EMAIL_FRUTA,
-            "EMAIL_PESCA_SE": self.EMAIL_PESCA_SE,
+            "EMAIL_PESCA": self.EMAIL_PESCA,
             "WEBHOOK_SECRET": self.WEBHOOK_SECRET,
             "WEBHOOK_ROLE_TYPE": self.WEBHOOK_ROLE_TYPE,
             "WEBHOOK_PUBLIC_URL": self.WEBHOOK_PUBLIC_URL,
