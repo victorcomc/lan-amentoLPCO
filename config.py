@@ -29,8 +29,9 @@ class Config:
     # Destinatários por tipo de LPCO
     EMAIL_FRUTA: str = os.getenv("EMAIL_FRUTA", "")   # modelo E00144
     EMAIL_PESCA: str = os.getenv("EMAIL_PESCA", "")   # modelo E00061 (sudeste e nordeste)
-    # CPF/CNPJ do titular do cert nordeste (Felipe)
-    CERT_NE_OWNER_ID: str = os.getenv("CERT_NE_OWNER_ID", "")
+    # CPFs dos titulares dos certificados — usados para filtrar eventos que são de vocês
+    CERT_SE_OWNER_ID: str = os.getenv("CERT_SE_OWNER_ID", "")  # Diogenes (sudeste)
+    CERT_NE_OWNER_ID: str = os.getenv("CERT_NE_OWNER_ID", "")  # Felipe (nordeste)
 
     # Webhook receiver
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")

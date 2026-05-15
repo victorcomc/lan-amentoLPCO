@@ -128,6 +128,14 @@ def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> N
     codigo_modelo = payload.get("codigoModelo", "")
 
     if event_type == EVENTO_ALTSIT:
+        cpf_cnpj_list = payload.get("cpfCnpj", [])
+        cpfs_hevile = {config.CERT_SE_OWNER_ID, config.CERT_NE_OWNER_ID} - {""}
+        if cpfs_hevile and not cpfs_hevile.intersection(cpf_cnpj_list):
+            logger.info(
+                "LPCO %s ignorado — CPF Hevile não está em cpfCnpj %s.",
+                numero_lpco, cpf_cnpj_list,
+            )
+            return
         _handle_alteracao_situacao(numero_lpco, codigo_modelo, payload, destinatario_id)
 
     elif event_type == EVENTO_EXIG:
