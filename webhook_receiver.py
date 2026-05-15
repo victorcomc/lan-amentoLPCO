@@ -36,6 +36,10 @@ SITUACOES_NOTIFICAR = frozenset({
     "INDEFERIDO",      # Negado — também queremos saber
 })
 
+# Modelos conhecidos
+MODELO_FRUTA = "E00144"
+MODELO_PESCA = "E00061"
+
 # Evento principal: anuente altera a situação do LPCO
 EVENTO_ALTSIT   = "talp-altsit-lpco-anu"
 
@@ -77,7 +81,7 @@ def receber_notificacao():
     # ACK imediato — processo em thread separada
     threading.Thread(
         target=_processar,
-        args=(event_type, raw_body),
+        args=(event_type, raw_body, destinatario),
         daemon=True,
     ).start()
 
@@ -103,7 +107,20 @@ def _secret_valido(received: str) -> bool:
     )
 
 
-def _processar(event_type: str, raw_body: bytes) -> None:
+def _resolver_destinatarios(modelo: str, destinatario_id: str) -> list[str]:
+    """Mapeia modelo de LPCO + cert owner para a lista de destinatários de email."""
+    if modelo == MODELO_FRUTA:
+        return [config.EMAIL_FRUTA]
+    if modelo == MODELO_PESCA:
+        # Se o cert nordeste (Felipe) estiver configurado e este evento é dele → NE
+        if config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID:
+            return [config.EMAIL_PESCA_NE] if config.EMAIL_PESCA_NE else [config.EMAIL_OPERACAO]
+        return [config.EMAIL_PESCA_SE]
+    logger.warning("Modelo desconhecido '%s' (destinatario=%s) — usando EMAIL_OPERACAO.", modelo, destinatario_id)
+    return [config.EMAIL_OPERACAO]
+
+
+def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> None:
     try:
         payload = json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
@@ -114,7 +131,7 @@ def _processar(event_type: str, raw_body: bytes) -> None:
     codigo_modelo = payload.get("codigoModelo", "")
 
     if event_type == EVENTO_ALTSIT:
-        _handle_alteracao_situacao(numero_lpco, codigo_modelo, payload)
+        _handle_alteracao_situacao(numero_lpco, codigo_modelo, payload, destinatario_id)
 
     elif event_type == EVENTO_EXIG:
         _handle_exigencia(numero_lpco, payload)
@@ -129,7 +146,7 @@ def _processar(event_type: str, raw_body: bytes) -> None:
         )
 
 
-def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict) -> None:
+def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinatario_id: str = "") -> None:
     """
     talp-altsit-lpco-anu
     Dispara email quando novaSituacao.id == "DEFERIDO" ou "INDEFERIDO".
@@ -146,7 +163,8 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict) -> None:
         return
 
     cnpj_list = payload.get("cpfCnpj", [])
-    destinatarios = [config.EMAIL_OPERACAO]
+    destinatarios = _resolver_destinatarios(modelo, destinatario_id)
+    logger.info("LPCO %s [modelo=%s] → destinatários: %s", numero, modelo, destinatarios)
 
     detalhes_email = {
         "Número LPCO":    numero,
