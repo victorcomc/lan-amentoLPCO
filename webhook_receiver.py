@@ -161,10 +161,20 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinat
 
     cnpj_list = payload.get("cpfCnpj", [])
     destinatarios = _resolver_destinatarios(modelo, destinatario_id)
-    logger.info("LPCO %s [modelo=%s] → destinatários: %s", numero, modelo, destinatarios)
+
+    if modelo == MODELO_FRUTA:
+        tipo_label = "Fruta"
+    elif modelo == MODELO_PESCA:
+        regiao = "NE" if (config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID) else "SE"
+        tipo_label = f"Pesca {regiao}"
+    else:
+        tipo_label = modelo
+
+    logger.info("LPCO %s [%s] → destinatários: %s", numero, tipo_label, destinatarios)
 
     detalhes_email = {
         "Número LPCO":    numero,
+        "Tipo":           tipo_label,
         "Modelo":         modelo,
         "Nova Situação":  f"{situacao_id} — {situacao_desc}",
         "Justificativa":  justificativa or "(não informada)",
@@ -178,6 +188,7 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinat
             situacao=f"{situacao_id} — {situacao_desc}",
             detalhes=detalhes_email,
             destinatarios=destinatarios,
+            tipo=tipo_label,
         )
     except Exception as exc:
         logger.error("Falha ao enviar email para LPCO %s: %s", numero, exc)

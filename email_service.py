@@ -33,14 +33,17 @@ def notificar_lpco_liberado(
     situacao: str,
     detalhes: dict,
     destinatarios: list[str],
+    tipo: str = "",
 ) -> None:
     """
     Dispara email quando um LPCO é deferido/aprovado.
     `detalhes` é o payload bruto recebido no webhook.
+    `tipo` aparece no assunto: ex "Fruta", "Pesca SE", "Pesca NE".
     """
+    tipo_suffix = f" ({tipo})" if tipo else ""
     corpo = f"""
     <html><body>
-    <h2>LPCO {numero_lpco} — {situacao}</h2>
+    <h2>LPCO {numero_lpco} — {situacao}{tipo_suffix}</h2>
     <p>O LPCO <strong>{numero_lpco}</strong> teve sua situação atualizada para
     <strong>{situacao}</strong>.</p>
     <h3>Dados do evento</h3>
@@ -51,7 +54,7 @@ def notificar_lpco_liberado(
     </body></html>
     """
     _send(
-        subject=f"[LPCO] {numero_lpco} — {situacao}",
+        subject=f"[LPCO] {numero_lpco} — {situacao}{tipo_suffix}",
         body_html=corpo,
         to=destinatarios,
     )
