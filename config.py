@@ -42,6 +42,13 @@ class Config:
     # Verificação de saúde da subscrição
     WEBHOOK_HEALTH_CHECK_HOURS: int = int(os.getenv("WEBHOOK_HEALTH_CHECK_HOURS", "6"))
 
+    # Microsoft Graph API — leitura da planilha SharePoint
+    GRAPH_TENANT_ID: str = os.getenv("GRAPH_TENANT_ID", "")
+    GRAPH_CLIENT_ID: str = os.getenv("GRAPH_CLIENT_ID", "")
+    GRAPH_CLIENT_SECRET: str = os.getenv("GRAPH_CLIENT_SECRET", "")
+    GRAPH_FILE_ID: str = os.getenv("GRAPH_FILE_ID", "")
+    GRAPH_SITE_PATH: str = os.getenv("GRAPH_SITE_PATH", "")
+
     def validate(self) -> None:
         required = {
             "CERT_PFX_PASSWORD": self.CERT_PFX_PASSWORD,

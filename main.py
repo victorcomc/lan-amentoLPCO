@@ -15,6 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import config
 from database import init_db
+from sharepoint_sync import sincronizar_planilha
 from webhook_manager import WebhookManager
 from webhook_receiver import iniciar_servidor
 from email_service import notificar_falha_webhook
@@ -70,8 +71,9 @@ def main() -> None:
         logger.critical("Configuração inválida: %s", exc)
         sys.exit(1)
 
-    # 2. Inicializa banco de LPCOs conhecidos
+    # 2. Inicializa banco de LPCOs conhecidos e sincroniza planilha
     init_db()
+    sincronizar_planilha()
 
     # 3. Registra/verifica subscrição no portal
     try:
@@ -88,7 +90,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # 4. Agenda verificação de saúde
+    # 4. Agenda jobs periódicos
     scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
     scheduler.add_job(
         verificar_saude_webhook,
@@ -96,9 +98,15 @@ def main() -> None:
         hours=config.WEBHOOK_HEALTH_CHECK_HOURS,
         id="health_check",
     )
+    scheduler.add_job(
+        sincronizar_planilha,
+        "interval",
+        hours=1,
+        id="sharepoint_sync",
+    )
     scheduler.start()
     logger.info(
-        "Verificação de saúde agendada a cada %dh.",
+        "Jobs agendados: saúde a cada %dh, sync SharePoint a cada 1h.",
         config.WEBHOOK_HEALTH_CHECK_HOURS,
     )
 
