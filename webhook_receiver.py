@@ -19,6 +19,7 @@ import threading
 from flask import Flask, request, jsonify
 
 from config import config
+from database import lpco_conhecido, registrar_lpco
 from email_service import notificar_lpco_liberado, notificar_falha_webhook
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,28 @@ def receber_notificacao():
     return "", 200
 
 
+@app.route("/lpco/registrar", methods=["POST"])
+def registrar_lpco_endpoint():
+    """
+    Chamado pelo Power Automate quando um novo LPCO é adicionado na planilha.
+    Body JSON: {"numero": "E2600287640"}
+    Header: Secret: <WEBHOOK_SECRET>
+    """
+    secret = request.headers.get("Secret", "")
+    if not _secret_valido(secret):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    numero = str(data.get("numero", "")).strip().upper()
+    if not numero:
+        return jsonify({"error": "campo 'numero' obrigatorio"}), 400
+
+    novo = registrar_lpco(numero)
+    total = __import__("database").total_lpcos()
+    logger.info("LPCO %s %s via Power Automate. Total no banco: %d.", numero, "registrado" if novo else "já existia", total)
+    return jsonify({"ok": True, "numero": numero, "novo": novo}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
@@ -135,6 +158,9 @@ def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> N
     )
 
     if event_type == EVENTO_ALTSIT:
+        if not lpco_conhecido(numero_lpco):
+            logger.info("LPCO %s ignorado — não registrado como processo da Hevile.", numero_lpco)
+            return
         _handle_alteracao_situacao(numero_lpco, codigo_modelo, payload, destinatario_id)
 
     elif event_type == EVENTO_EXIG:

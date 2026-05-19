@@ -14,6 +14,7 @@ import os
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import config
+from database import init_db
 from webhook_manager import WebhookManager
 from webhook_receiver import iniciar_servidor
 from email_service import notificar_falha_webhook
@@ -69,7 +70,10 @@ def main() -> None:
         logger.critical("Configuração inválida: %s", exc)
         sys.exit(1)
 
-    # 2. Registra/verifica subscrição no portal
+    # 2. Inicializa banco de LPCOs conhecidos
+    init_db()
+
+    # 3. Registra/verifica subscrição no portal
     try:
         url = _url_webhook()
     except RuntimeError as exc:
@@ -84,7 +88,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # 3. Agenda verificação de saúde
+    # 4. Agenda verificação de saúde
     scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
     scheduler.add_job(
         verificar_saude_webhook,
