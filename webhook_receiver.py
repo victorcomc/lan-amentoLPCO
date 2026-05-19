@@ -31,11 +31,6 @@ app = Flask(__name__)
 # Identificadores conforme documentação "Intervenientes Privados" do TALPCO
 # ---------------------------------------------------------------------------
 
-# Situações que disparam email para o responsável
-SITUACOES_NOTIFICAR = frozenset({
-    "DEFERIDO",        # LPCO aprovado — evento principal
-    "INDEFERIDO",      # Negado — também queremos saber
-})
 
 # Modelos conhecidos
 MODELO_FRUTA = "E00144"
@@ -187,10 +182,6 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinat
     justificativa = payload.get("justificativa", "")
 
     logger.info("LPCO %s [%s] — nova situação: %s", numero, modelo, situacao_id)
-
-    if situacao_id not in SITUACOES_NOTIFICAR:
-        logger.info("Situação '%s' não requer notificação por email.", situacao_id)
-        return
 
     cnpj_list = payload.get("cpfCnpj", [])
     destinatarios = _resolver_destinatarios(modelo, destinatario_id)
