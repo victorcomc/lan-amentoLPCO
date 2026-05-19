@@ -126,13 +126,8 @@ def _secret_valido(received: str) -> bool:
 
 
 def _resolver_destinatarios(modelo: str, destinatario_id: str) -> list[str]:
-    """Mapeia modelo de LPCO para a lista de destinatários de email."""
-    if modelo == MODELO_FRUTA:
-        return [config.EMAIL_FRUTA]
-    if modelo == MODELO_PESCA:
-        return [config.EMAIL_PESCA]
-    logger.warning("Modelo desconhecido '%s' (destinatario=%s) — usando EMAIL_OPERACAO.", modelo, destinatario_id)
-    return [config.EMAIL_OPERACAO]
+    """Retorna destinatários de email. Fruta será configurada futuramente."""
+    return [config.EMAIL_PESCA]
 
 
 def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> None:
@@ -185,14 +180,8 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinat
 
     cnpj_list = payload.get("cpfCnpj", [])
     destinatarios = _resolver_destinatarios(modelo, destinatario_id)
-
-    if modelo == MODELO_FRUTA:
-        tipo_label = "Fruta"
-    elif modelo == MODELO_PESCA:
-        regiao = "NE" if (config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID) else "SE"
-        tipo_label = f"Pesca {regiao}"
-    else:
-        tipo_label = modelo
+    regiao = "NE" if (config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID) else "SE"
+    tipo_label = f"Pesca {regiao}"
 
     logger.info("LPCO %s [%s] → destinatários: %s", numero, tipo_label, destinatarios)
 
