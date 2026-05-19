@@ -19,7 +19,6 @@ import threading
 from flask import Flask, request, jsonify
 
 from config import config
-from database import lpco_conhecido
 from email_service import notificar_lpco_liberado, notificar_falha_webhook
 
 logger = logging.getLogger(__name__)
@@ -136,10 +135,10 @@ def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> N
     )
 
     if event_type == EVENTO_ALTSIT:
-        if not lpco_conhecido(numero_lpco):
+        if codigo_modelo not in (MODELO_FRUTA, MODELO_PESCA):
             logger.info(
-                "LPCO %s ignorado — não está na base de processos da Hevile.",
-                numero_lpco,
+                "LPCO %s ignorado — modelo '%s' não é da Hevile (fruta/pesca).",
+                numero_lpco, codigo_modelo,
             )
             return
         _handle_alteracao_situacao(numero_lpco, codigo_modelo, payload, destinatario_id)

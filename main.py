@@ -14,8 +14,6 @@ import os
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import config
-from database import init_db, salvar_lpcos, total_lpcos
-from siscomex_client import SiscomexClient
 from webhook_manager import WebhookManager
 from webhook_receiver import iniciar_servidor
 from email_service import notificar_falha_webhook
@@ -46,32 +44,6 @@ def _url_webhook() -> str:
     return url
 
 
-def sincronizar_lpcos() -> None:
-    """Job periódico: puxa todos os LPCOs do portal e salva no banco local."""
-    logger.info("Sincronizando LPCOs com o Portal Único...")
-    try:
-        with SiscomexClient() as client:
-            if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
-                logger.error("Sync: falha na autenticação.")
-                return
-
-            pagina, total_sync = 1, 0
-            while True:
-                resultado = client.buscar_lpcos(pagina=pagina, tamanho=50)
-                if not resultado.sucesso or not resultado.registros:
-                    break
-                salvos = salvar_lpcos(resultado.registros)
-                total_sync += salvos
-                logger.info("Sync página %d — %d LPCO(s) processados.", pagina, salvos)
-                if len(resultado.registros) < 50:
-                    break
-                pagina += 1
-
-        logger.info("Sync concluído. Total no banco: %d LPCO(s).", total_lpcos())
-    except Exception as exc:
-        logger.error("Erro na sincronização de LPCOs: %s", exc)
-
-
 def verificar_saude_webhook() -> None:
     """Job periódico: confirma que a subscrição está ativa."""
     mgr = WebhookManager(url_publica=_url_webhook())
@@ -97,11 +69,7 @@ def main() -> None:
         logger.critical("Configuração inválida: %s", exc)
         sys.exit(1)
 
-    # 2. Inicializa banco e faz sync inicial de LPCOs
-    init_db()
-    sincronizar_lpcos()
-
-    # 3. Registra/verifica subscrição no portal
+    # 2. Registra/verifica subscrição no portal
     try:
         url = _url_webhook()
     except RuntimeError as exc:
@@ -116,7 +84,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # 4. Agenda verificação de saúde e sync periódico
+    # 3. Agenda verificação de saúde
     scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
     scheduler.add_job(
         verificar_saude_webhook,
@@ -124,19 +92,14 @@ def main() -> None:
         hours=config.WEBHOOK_HEALTH_CHECK_HOURS,
         id="health_check",
     )
-    scheduler.add_job(
-        sincronizar_lpcos,
-        "interval",
-        minutes=30,
-        id="sync_lpcos",
-    )
     scheduler.start()
     logger.info(
-        "Agendamentos ativos: saúde a cada %dh, sync LPCOs a cada 30min.",
+        "Verificação de saúde agendada a cada %dh.",
         config.WEBHOOK_HEALTH_CHECK_HOURS,
     )
 
     # 4. Sobe o receiver Flask (bloqueante — mantém o processo vivo)
+
     logger.info("Iniciando receiver na porta %d...", config.WEBHOOK_PORT)
     try:
         iniciar_servidor()
