@@ -94,12 +94,21 @@ class WebhookManager:
             subs = self._listar(client)
             ativas = [s for s in subs if s.ativa and s.evento == EVENTO_LPCO]
 
-            if ativas:
+            corretas = [s for s in ativas if s.endpoint == self._url_publica]
+            if corretas:
                 logger.info(
                     "Subscrição LPCO %s já ativa (id=%d, endpoint=%s).",
-                    regiao, ativas[0].id, ativas[0].endpoint,
+                    regiao, corretas[0].id, corretas[0].endpoint,
                 )
                 return True
+
+            # Endpoint errado — remove e recria
+            for s in ativas:
+                logger.warning(
+                    "Subscrição %s com endpoint incorreto '%s' (id=%d). Removendo...",
+                    regiao, s.endpoint, s.id,
+                )
+                self._deletar(client, s.id)
 
             logger.info("Criando subscrição %s para %s...", EVENTO_LPCO, regiao)
             nova = self._criar(client)
@@ -155,6 +164,13 @@ class WebhookManager:
         except requests.HTTPError as exc:
             logger.error("Erro ao criar subscrição: HTTP %s — %s", exc.response.status_code, exc.response.text[:200])
             return None
+
+    def _deletar(self, client: SiscomexClient, subscricao_id: int) -> None:
+        try:
+            client._delete(f"{_WEBHOOK_PATH}/{subscricao_id}")  # type: ignore[attr-defined]
+            logger.info("Subscrição %d removida.", subscricao_id)
+        except requests.HTTPError as exc:
+            logger.error("Erro ao remover subscrição %d: %s", subscricao_id, exc)
 
     def _falhas(self, client: SiscomexClient) -> list[dict]:
         try:

@@ -194,6 +194,12 @@ class SiscomexClient:
         response.raise_for_status()
         return response.json()
 
+    def _delete(self, path: str) -> None:
+        assert self._session, "Use dentro de 'with SiscomexClient() as client:'"
+        url = f"{self._base_url}{path}"
+        logger.debug("DELETE %s", url)
+        self._session.delete(url, timeout=self._TIMEOUT).raise_for_status()
+
     def _post(self, path: str, payload: dict) -> dict | list:
         assert self._session, "Use dentro de 'with SiscomexClient() as client:'"
         url = f"{self._base_url}{path}"
