@@ -5,12 +5,15 @@ load_dotenv()
 
 
 class Config:
-    # Certificado A1 — duas formas de fornecer (use uma delas):
-    #   Arquivo local:  CERT_PFX_PATH + CERT_PFX_PASSWORD
-    #   Produção/Docker: CERT_PFX_BASE64 + CERT_PFX_PASSWORD
+    # Certificado A1 SE (Diogenes — sudeste)
     CERT_PFX_PATH: str = os.getenv("CERT_PFX_PATH", "")
     CERT_PFX_BASE64: str = os.getenv("CERT_PFX_BASE64", "")
     CERT_PFX_PASSWORD: str = os.getenv("CERT_PFX_PASSWORD", "")
+
+    # Certificado A1 NE (Felipe — nordeste) — opcional
+    CERT_NE_PFX_PATH: str = os.getenv("CERT_NE_PFX_PATH", "")
+    CERT_NE_PFX_BASE64: str = os.getenv("CERT_NE_PFX_BASE64", "")
+    CERT_NE_PFX_PASSWORD: str = os.getenv("CERT_NE_PFX_PASSWORD", "")
 
     # API Siscomex
     SISCOMEX_BASE_URL: str = os.getenv(

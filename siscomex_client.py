@@ -51,17 +51,19 @@ class PollingResult:
 # Gerenciamento do certificado em memória
 # ---------------------------------------------------------------------------
 
-def _load_pfx(pfx_path: str, pfx_password: str) -> tuple[bytes, bytes]:
+def _load_pfx(pfx_path: str, pfx_password: str, pfx_base64: str = "") -> tuple[bytes, bytes]:
     """
-    Lê o .pfx (de arquivo ou de CERT_PFX_BASE64) e retorna (cert_pem, key_pem).
-    Lança ValueError se a senha estiver errada ou o arquivo corrompido.
+    Lê o .pfx e retorna (cert_pem, key_pem).
+    Prioridade: pfx_base64 > pfx_path.
     """
     import base64
-    if config.CERT_PFX_BASE64:
-        pfx_data = base64.b64decode(config.CERT_PFX_BASE64)
-    else:
+    if pfx_base64:
+        pfx_data = base64.b64decode(pfx_base64)
+    elif pfx_path:
         with open(pfx_path, "rb") as f:
             pfx_data = f.read()
+    else:
+        raise ValueError("Certificado não configurado: forneça PFX_BASE64 ou PFX_PATH.")
 
     password_bytes = pfx_password.encode("utf-8")
 
@@ -137,12 +139,18 @@ class SiscomexClient:
     _LPCO_HISTORICO         = "/talpco/api/ext/lpco/{numero}/historico"
     _LPCO_SITUACAO          = "/talpco/api/ext/lpco/situacao/{numero}"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        cert_pfx_path: str = "",
+        cert_pfx_base64: str = "",
+        cert_pfx_password: str = "",
+    ) -> None:
         self._base_url = config.SISCOMEX_BASE_URL.rstrip("/")
         self._cnpj     = config.SISCOMEX_CNPJ
-        self._cert_pem, self._key_pem = _load_pfx(
-            config.CERT_PFX_PATH, config.CERT_PFX_PASSWORD
-        )
+        pfx_path     = cert_pfx_path     or config.CERT_PFX_PATH
+        pfx_base64   = cert_pfx_base64   or config.CERT_PFX_BASE64
+        pfx_password = cert_pfx_password or config.CERT_PFX_PASSWORD
+        self._cert_pem, self._key_pem = _load_pfx(pfx_path, pfx_password, pfx_base64)
         self._session: requests.Session | None = None
         self._cert_ctx: Any = None
 

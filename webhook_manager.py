@@ -56,15 +56,39 @@ class WebhookManager:
 
     def garantir_subscricao_ativa(self) -> bool:
         """
-        Verifica se há subscrição ativa. Se não houver, cria uma.
-        Retorna True se tudo estiver OK.
+        Garante subscrições ativas para SE e, se configurado, NE.
+        Retorna True somente se todas as subscrições necessárias estiverem OK.
         """
-        with SiscomexClient() as client:
+        ok_se = self._garantir_cert(
+            config.CERT_PFX_PATH,
+            config.CERT_PFX_BASE64,
+            config.CERT_PFX_PASSWORD,
+            "SE",
+        )
+
+        if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
+            ok_ne = self._garantir_cert(
+                config.CERT_NE_PFX_PATH,
+                config.CERT_NE_PFX_BASE64,
+                config.CERT_NE_PFX_PASSWORD,
+                "NE",
+            )
+        else:
+            logger.info("Certificado NE não configurado — subscrição NE ignorada.")
+            ok_ne = True
+
+        return ok_se and ok_ne
+
+    def _garantir_cert(
+        self, pfx_path: str, pfx_base64: str, pfx_password: str, regiao: str
+    ) -> bool:
+        with SiscomexClient(
+            cert_pfx_path=pfx_path,
+            cert_pfx_base64=pfx_base64,
+            cert_pfx_password=pfx_password,
+        ) as client:
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
-                logger.error(
-                    "Não foi possível autenticar para gerenciar webhook. "
-                    "Verifique WEBHOOK_ROLE_TYPE no .env."
-                )
+                logger.error("Autenticação falhou para certificado %s.", regiao)
                 return False
 
             subs = self._listar(client)
@@ -72,21 +96,18 @@ class WebhookManager:
 
             if ativas:
                 logger.info(
-                    "Subscrição LPCO já ativa (id=%d, endpoint=%s).",
-                    ativas[0].id,
-                    ativas[0].endpoint,
+                    "Subscrição LPCO %s já ativa (id=%d, endpoint=%s).",
+                    regiao, ativas[0].id, ativas[0].endpoint,
                 )
                 return True
 
-            logger.info("Nenhuma subscrição ativa para %s. Criando...", EVENTO_LPCO)
+            logger.info("Criando subscrição %s para %s...", EVENTO_LPCO, regiao)
             nova = self._criar(client)
             if nova:
-                logger.info(
-                    "Subscrição criada com sucesso (id=%d).", nova.id
-                )
+                logger.info("Subscrição %s criada (id=%d).", regiao, nova.id)
                 return True
 
-            logger.error("Falha ao criar subscrição de webhook.")
+            logger.error("Falha ao criar subscrição %s.", regiao)
             return False
 
     def verificar_falhas(self) -> list[dict]:
