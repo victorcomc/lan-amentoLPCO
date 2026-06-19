@@ -368,24 +368,17 @@ class SiscomexClient:
 
     def consultar_due(self, numero: str) -> dict:
         """
-        Tenta obter os detalhes de uma DUE experimentando múltiplos endpoints.
-        Retorna o primeiro que responder 200, ou dict vazio se nenhum funcionar.
-        O endpoint correto será descoberto na primeira chamada real e logado.
+        Retorna o detalhe completo de uma DUE.
+        Endpoint oficial: GET /due/api/ext/due/numero-da-due/{numero}
         """
         candidatos = [
-            # Módulo DUEX (módulo interno do evento duex-historico)
+            # Endpoint oficial (docs.portalunico.siscomex.gov.br/api/duex/)
+            f"/due/api/ext/due/numero-da-due/{numero}",
+            # Endpoint de dados resumidos (fallback mais leve)
+            f"/due/api/ext/due/consultarDadosResumidosDUE?numero={numero}",
+            # Fallbacks legados testados anteriormente
             f"/duex/api/ext/due/{numero}",
-            f"/duex/api/ext/due/{numero}/detalhes",
-            f"/duex/api/ext/due?numeroDUE={numero}",
-            f"/duex/api/ext/due?numero={numero}",
-            # Módulo exportacao
             f"/exportacao/api/ext/due/{numero}",
-            f"/exportacao/api/ext/due/{numero}/detalhes",
-            f"/exportacao/api/ext/due?numeroDUE={numero}",
-            f"/exportacao/api/ext/due?numero={numero}",
-            # Módulo due genérico
-            f"/due/api/ext/due/{numero}",
-            f"/due/api/ext/due?numeroDUE={numero}",
         ]
         for path in candidatos:
             try:
@@ -396,7 +389,6 @@ class SiscomexClient:
                 code = exc.response.status_code
                 logger.debug("DUE %s: %s → HTTP %d", numero, path, code)
                 if code == 400:
-                    # endpoint existe mas parâmetro errado — loga body para análise
                     logger.info(
                         "DUE %s: 400 em %s — body: %s", numero, path,
                         exc.response.text[:300],
@@ -404,11 +396,7 @@ class SiscomexClient:
             except Exception as exc:
                 logger.debug("DUE %s: %s → %s", numero, path, exc)
 
-        logger.warning(
-            "DUE %s: nenhum endpoint respondeu 200. "
-            "Quando o primeiro evento real chegar, verifique o log acima.",
-            numero,
-        )
+        logger.warning("DUE %s: nenhum endpoint respondeu 200.", numero)
         return {}
 
     # ------------------------------------------------------------------

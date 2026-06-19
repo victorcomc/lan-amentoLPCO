@@ -424,85 +424,75 @@ def _consultar_e_enriquecer_due(numero: str, due_id: int) -> None:
 
 def _extrair_campos_due(detalhe: dict) -> dict:
     """
-    Tenta extrair campos relevantes de um detalhe de DUE.
-    Os nomes reais dos campos serão confirmados quando o primeiro 200 chegar.
+    Extrai campos da resposta de GET /due/api/ext/due/numero-da-due/{numero}.
+
+    Estrutura real (docs.portalunico.siscomex.gov.br/api/duex/):
+      detalhe.itens[].exportador.numeroDoDocumento  → CNPJ/CPF exportador
+      detalhe.itens[].exportador.nome               → nome exportador
+      detalhe.itens[].ncm.codigo / .descricao       → NCM
+      detalhe.itens[].pesoLiquidoTotal              → peso por item (soma = total)
+      detalhe.itens[].valorDaMercadoriaNaCondicaoDeVenda → FOB por item
+      detalhe.itens[].listaPaisDestino[].nome       → país destino
+      detalhe.itens[].tratamentosAdministrativos[].codigoLPCO → LPCO vinculado
+      detalhe.recintoAduaneiroDeEmbarque.descricao  → porto de embarque
+      detalhe.valorTotalMercadoria                  → FOB total
+      detalhe.paisImportador.nome                   → país importador (fallback)
     """
-    campos: dict = {}
+    itens = detalhe.get("itens") or []
 
-    # Exportador — variações comuns de nome de campo
-    for path in [
-        ("exportador", "cnpj"),
-        ("declarante", "cnpj"),
-        ("cnpjExportador",),
-        ("cnpj",),
-    ]:
-        val = detalhe
-        for k in path:
-            val = val.get(k, {}) if isinstance(val, dict) else {}
-        if val and isinstance(val, str):
-            campos["exportador_cnpj"] = val
+    # Exportador — pega do primeiro item que tiver o campo preenchido
+    exportador_cnpj = ""
+    exportador_nome = ""
+    for item in itens:
+        exp = item.get("exportador") or {}
+        doc = exp.get("numeroDoDocumento", "")
+        if doc:
+            exportador_cnpj = doc
+            exportador_nome = exp.get("nome", "")
             break
 
-    for path in [
-        ("exportador", "nome"),
-        ("declarante", "nome"),
-        ("nomeExportador",),
-        ("razaoSocial",),
-    ]:
-        val = detalhe
-        for k in path:
-            val = val.get(k, {}) if isinstance(val, dict) else {}
-        if val and isinstance(val, str):
-            campos["exportador_nome"] = val
-            break
+    # NCM e descrição — primeiro item
+    primeiro = itens[0] if itens else {}
+    ncm_obj  = primeiro.get("ncm") or {}
+    ncm_codigo = ncm_obj.get("codigo", "")
+    ncm_desc   = ncm_obj.get("descricao", "") or primeiro.get("descricaoDaMercadoria", "")
 
-    # Produto — pega primeiro item se houver lista
-    itens = detalhe.get("itens") or detalhe.get("mercadorias") or []
-    if isinstance(itens, list) and itens:
-        primeiro = itens[0] if isinstance(itens[0], dict) else {}
-        campos["produto_ncm"]  = str(primeiro.get("ncm") or primeiro.get("codigoNcm", ""))
-        campos["produto_desc"] = str(primeiro.get("descricao") or primeiro.get("denominacaoMercadoria", ""))
+    # Peso líquido total (soma de todos os itens)
+    try:
+        peso_liquido = sum(float(item.get("pesoLiquidoTotal") or 0) for item in itens)
+    except (TypeError, ValueError):
+        peso_liquido = 0.0
 
-    # Pesos
-    for k in ("pesoLiquido", "peso_liquido", "pesoLiquidoTotal"):
-        if detalhe.get(k) is not None:
-            try:
-                campos["peso_liquido_kg"] = float(detalhe[k])
-            except (TypeError, ValueError):
-                pass
-            break
-    for k in ("pesoBruto", "peso_bruto", "pesoBrutoTotal"):
-        if detalhe.get(k) is not None:
-            try:
-                campos["peso_bruto_kg"] = float(detalhe[k])
-            except (TypeError, ValueError):
-                pass
-            break
+    # Valor FOB total
+    try:
+        fob = float(detalhe.get("valorTotalMercadoria") or 0)
+        if not fob and primeiro:
+            fob = float(primeiro.get("valorDaMercadoriaNaCondicaoDeVenda") or 0)
+    except (TypeError, ValueError):
+        fob = 0.0
 
-    # Valor FOB
-    for k in ("valorFob", "valor_fob", "valorTotalFob", "vmle"):
-        if detalhe.get(k) is not None:
-            try:
-                campos["valor_fob_usd"] = float(detalhe[k])
-            except (TypeError, ValueError):
-                pass
-            break
+    # País destino — primeiro país do primeiro item, fallback no paisImportador
+    paises = primeiro.get("listaPaisDestino") or []
+    if paises and isinstance(paises[0], dict):
+        pais = paises[0].get("nome", "")
+    else:
+        pais_imp = detalhe.get("paisImportador") or {}
+        pais = pais_imp.get("nome", "") if isinstance(pais_imp, dict) else ""
 
-    # Destino / embarque
-    for k in ("paisDestino", "pais_destino", "codigoPaisDestino"):
-        if detalhe.get(k):
-            campos["pais_destino"] = str(detalhe[k])
-            break
-    for k in ("portoEmbarque", "porto_embarque", "localEmbarque", "codigoPortoEmbarque"):
-        if detalhe.get(k):
-            campos["porto_embarque"] = str(detalhe[k])
-            break
-    for k in ("embarcacao", "nomeEmbarcacao", "navio"):
-        if detalhe.get(k):
-            campos["embarcacao"] = str(detalhe[k])
-            break
+    # Porto de embarque
+    recinto_emb = detalhe.get("recintoAduaneiroDeEmbarque") or {}
+    porto = recinto_emb.get("descricao", "") if isinstance(recinto_emb, dict) else ""
 
-    return campos
+    return {
+        "exportador_cnpj": exportador_cnpj,
+        "exportador_nome": exportador_nome,
+        "produto_ncm":     ncm_codigo,
+        "produto_desc":    ncm_desc,
+        "peso_liquido_kg": round(peso_liquido, 3) if peso_liquido else None,
+        "valor_fob_usd":   round(fob, 2) if fob else None,
+        "pais_destino":    pais,
+        "porto_embarque":  porto,
+    }
 
 
 def _handle_exigencia(numero: str, payload: dict) -> None:
