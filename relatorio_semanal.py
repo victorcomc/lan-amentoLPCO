@@ -265,6 +265,161 @@ def _top_n(contador: dict, n: int = 10) -> list[tuple]:
 
 
 # ---------------------------------------------------------------------------
+# Aba 0 — Visão Consolidada (LPCO + DUE cruzados por empresa)
+# ---------------------------------------------------------------------------
+
+def _aba_visao_consolidada(wb: Any, dados_lpco: list[dict], dues: list[dict]) -> None:
+    """
+    Aba principal: cruza LPCOs e DUEs pelo CNPJ do exportador.
+
+    Para cada empresa mostra:
+      - Quantos LPCOs tem (autorizações emitidas)
+      - Quais DUEs estão vinculadas (embarques confirmados)
+      - Kg autorizados (LPCO) vs. Kg embarcados (DUE)
+      - Valor FOB (DUE) quando disponível
+      - Produtos, destinos, portos, embarcações consolidados
+    """
+    from openpyxl.styles import PatternFill, Font, Alignment
+
+    ws = wb.active
+    ws.title = "Visão Consolidada"
+
+    _aplicar_cabecalho(ws, [
+        "CNPJ / CPF", "Nome Empresa", "UF",
+        # LPCO
+        "LPCOs (Autorizações)", "Kg Autorizado (LPCO)", "Kg Utilizado (LPCO)", "% Utilização",
+        "Situações LPCO",
+        # DUE
+        "DUEs (Embarques)", "Kg Embarcado (DUE)", "Valor FOB (USD)",
+        # Cruzamento
+        "Saldo Autorizado vs Embarcado (kg)",
+        # Comum
+        "Produtos / Espécies", "NCMs", "Países Destino",
+        "Portos Embarque", "Embarcações",
+        # Referências
+        "Números LPCO", "Números DUE",
+    ], cor_hex="243F60")
+
+    # Indexa DUEs por CNPJ do exportador
+    dues_por_cnpj: dict[str, list] = defaultdict(list)
+    for d in dues:
+        cnpj = d.get("exportador_cnpj", "")
+        if cnpj:
+            dues_por_cnpj[cnpj].append(d)
+        else:
+            # DUE sem CNPJ identificado ainda (endpoint não retornou 200)
+            dues_por_cnpj["__sem_cnpj__"].append(d)
+
+    # Indexa LPCOs por CNPJ
+    lpcos_por_cnpj: dict[str, list] = defaultdict(list)
+    for d in dados_lpco:
+        lpcos_por_cnpj[d["cnpj"] or "N/I"].append(d)
+
+    # União de todos os CNPJs conhecidos
+    todos_cnpj = set(lpcos_por_cnpj.keys()) | set(dues_por_cnpj.keys()) - {"__sem_cnpj__"}
+
+    linhas = []
+    for cnpj in todos_cnpj:
+        lpcos = lpcos_por_cnpj.get(cnpj, [])
+        dues_emp = dues_por_cnpj.get(cnpj, [])
+
+        nome = next((d["nome_empresa"] for d in lpcos if d.get("nome_empresa")), "") or \
+               next((d.get("exportador_nome", "") for d in dues_emp if d.get("exportador_nome")), "")
+        uf   = next((d.get("uf", "") for d in lpcos if d.get("uf")), "")
+
+        # LPCO totals
+        kg_autorizado = sum(d.get("quantidade") or 0 for d in lpcos)
+        kg_utilizado  = sum(d.get("qtd_utilizada") or 0 for d in lpcos)
+        pct_util      = f"{100*kg_utilizado/kg_autorizado:.0f}%" if kg_autorizado else ""
+        sits: dict[str, int] = defaultdict(int)
+        for d in lpcos:
+            sits[d.get("situacao_id") or "N/I"] += 1
+        sits_str = "  ".join(f"{k}:{v}" for k, v in sorted(sits.items()))
+
+        # DUE totals
+        kg_embarcado = 0.0
+        fob_total    = 0.0
+        dues_set     = set()
+        for d in dues_emp:
+            dues_set.add(d["numero_due"])
+            try:
+                kg_embarcado += float(d.get("peso_liquido_kg") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                fob_total += float(d.get("valor_fob_usd") or 0)
+            except (TypeError, ValueError):
+                pass
+
+        # Saldo
+        if kg_autorizado and kg_embarcado:
+            saldo_cruzado = round(kg_autorizado - kg_embarcado, 1)
+        else:
+            saldo_cruzado = ""
+
+        # Conjuntos comuns
+        produtos = set()
+        ncms     = set()
+        paises   = set()
+        portos   = set()
+        embarcacoes = set()
+        for d in lpcos:
+            if d.get("descricao_produto"): produtos.add(d["descricao_produto"])
+            if d.get("ncm"):               ncms.add(d["ncm"])
+            if d.get("pais_destino"):      paises.add(d["pais_destino"])
+            if d.get("porto_embarque"):    portos.add(d["porto_embarque"])
+            if d.get("embarcacao"):        embarcacoes.add(d["embarcacao"])
+        for d in dues_emp:
+            if d.get("produto_desc"):  produtos.add(d["produto_desc"])
+            if d.get("produto_ncm"):   ncms.add(d["produto_ncm"])
+            if d.get("pais_destino"):  paises.add(d["pais_destino"])
+            if d.get("porto_embarque"):portos.add(d["porto_embarque"])
+            if d.get("embarcacao"):    embarcacoes.add(d["embarcacao"])
+
+        nums_lpco = " | ".join(sorted(d["numero_lpco"] for d in lpcos)) if lpcos else ""
+        nums_due  = " | ".join(sorted(dues_set)) if dues_set else ""
+
+        linhas.append((
+            cnpj, nome, uf,
+            len(lpcos), round(kg_autorizado, 1) if kg_autorizado else "",
+            round(kg_utilizado, 1) if kg_utilizado else "", pct_util,
+            sits_str,
+            len(dues_set), round(kg_embarcado, 1) if kg_embarcado else "",
+            round(fob_total, 2) if fob_total else "",
+            saldo_cruzado,
+            " | ".join(sorted(produtos)),
+            " | ".join(sorted(ncms)),
+            " | ".join(sorted(paises)),
+            " | ".join(sorted(portos)),
+            " | ".join(sorted(embarcacoes)),
+            nums_lpco, nums_due,
+        ))
+
+    # Ordena por maior número de LPCOs
+    for linha in sorted(linhas, key=lambda x: -(x[3] if isinstance(x[3], int) else 0)):
+        ws.append(list(linha))
+
+    # DUEs sem CNPJ identificado (endpoint ainda não retornou detalhe)
+    sem_cnpj = dues_por_cnpj.get("__sem_cnpj__", [])
+    if sem_cnpj:
+        ws.append([])
+        ws.append(["--- DUEs sem CNPJ identificado (detalhe API pendente) ---"] + [""] * 18)
+        for d in sem_cnpj:
+            ws.append([
+                d["numero_due"], "(aguardando detalhe API)", "",
+                "", "", "", "", "",
+                1, d.get("peso_liquido_kg") or "", d.get("valor_fob_usd") or "",
+                "", d.get("produto_desc", ""), d.get("produto_ncm", ""),
+                d.get("pais_destino", ""), d.get("porto_embarque", ""), d.get("embarcacao", ""),
+                "", d["numero_due"],
+            ])
+
+    _ajustar_colunas(ws)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+# ---------------------------------------------------------------------------
 # Aba 1 — Resumo por Cliente (LPCO)
 # ---------------------------------------------------------------------------
 
@@ -673,6 +828,7 @@ def _gerar_excel_completo(dados_lpco: list[dict], dues: list[dict], periodo_labe
 
     wb = openpyxl.Workbook()
 
+    _aba_visao_consolidada(wb, dados_lpco, dues)
     _aba_resumo_clientes(wb, dados_lpco)
     _aba_detalhe_lpco(wb, dados_lpco)
     if dues:
