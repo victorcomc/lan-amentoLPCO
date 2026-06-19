@@ -196,6 +196,9 @@ def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> N
             return
         _handle_alteracao_situacao(numero_lpco, codigo_modelo, payload, destinatario_id)
 
+    elif event_type == "duex-historico":
+        _handle_due(payload)
+
     elif event_type == EVENTO_EXIG:
         _handle_exigencia(numero_lpco, payload)
 
@@ -263,6 +266,64 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinat
         )
     except Exception as exc:
         logger.error("Falha ao enviar email para LPCO %s: %s", numero, exc)
+
+
+def _handle_due(payload: dict) -> None:
+    """
+    duex-historico — recebido quando uma DUE muda de estado.
+
+    Payload: {"tipo": "DESEMBARACADA", "descricao": "...", "data": "...",
+              "due": {"numero": "26BR...", "ruc": "6BR..."}}
+
+    Após receber o número, tenta consultar o detalhe via API para descobrir
+    o endpoint correto e logar todos os campos disponíveis (FOB, frete, peso, etc.).
+    """
+    due_obj   = payload.get("due") or {}
+    numero    = due_obj.get("numero", "")
+    ruc       = due_obj.get("ruc", "")
+    tipo      = payload.get("tipo", "")
+    descricao = payload.get("descricao", "")
+    data_ev   = payload.get("data", "")
+
+    logger.info(
+        "=== DUE RECEBIDA === numero=%s ruc=%s tipo=%s descricao=%s data=%s",
+        numero, ruc, tipo, descricao, data_ev,
+    )
+
+    if not numero:
+        logger.warning("Evento duex-historico sem número de DUE — ignorando.")
+        return
+
+    # Consulta detalhe em thread separada para não atrasar o ACK
+    threading.Thread(
+        target=_consultar_e_logar_due,
+        args=(numero,),
+        daemon=True,
+    ).start()
+
+
+def _consultar_e_logar_due(numero: str) -> None:
+    """Abre sessão e tenta obter o detalhe completo da DUE."""
+    from siscomex_client import SiscomexClient
+    try:
+        with SiscomexClient() as client:
+            if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
+                logger.error("DUE %s: autenticação falhou para consulta de detalhe.", numero)
+                return
+            detalhe = client.consultar_due(numero)
+            if detalhe:
+                logger.info(
+                    "=== DUE DETALHE === numero=%s dados=%s",
+                    numero, json.dumps(detalhe, ensure_ascii=False),
+                )
+            else:
+                logger.warning(
+                    "DUE %s: detalhe não disponível ainda. "
+                    "Endpoint será descoberto conforme eventos chegarem.",
+                    numero,
+                )
+    except Exception as exc:
+        logger.error("DUE %s: erro ao consultar detalhe: %s", numero, exc)
 
 
 def _handle_exigencia(numero: str, payload: dict) -> None:

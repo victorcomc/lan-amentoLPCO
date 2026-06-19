@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 # Evento principal: anuente altera a situação do LPCO (intervenientes privados)
 EVENTO_LPCO = "talp-altsit-lpco-anu"
 
+# Evento DUE: qualquer alteração de estado da Declaração Única de Exportação
+EVENTO_DUE = "duex-historico"
+
 _WEBHOOK_PATH = "/portal/api/ext/webhook"
 
 
@@ -119,6 +122,64 @@ class WebhookManager:
             logger.error("Falha ao criar subscrição %s.", regiao)
             return False
 
+    def garantir_subscricao_due(self) -> bool:
+        """
+        Garante subscrição ativa para eventos DUE (duex-historico) com o certificado SE.
+        Independente das subscrições LPCO — não as afeta.
+        """
+        return self._garantir_cert_evento(
+            config.CERT_PFX_PATH,
+            config.CERT_PFX_BASE64,
+            config.CERT_PFX_PASSWORD,
+            EVENTO_DUE,
+            "DUE-SE",
+        )
+
+    def _garantir_cert_evento(
+        self,
+        pfx_path: str,
+        pfx_base64: str,
+        pfx_password: str,
+        evento: str,
+        label: str,
+    ) -> bool:
+        """Garante subscrição ativa para um evento específico. Reutilizável."""
+        with SiscomexClient(
+            cert_pfx_path=pfx_path,
+            cert_pfx_base64=pfx_base64,
+            cert_pfx_password=pfx_password,
+        ) as client:
+            if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
+                logger.error("Autenticação falhou para subscrição %s.", label)
+                return False
+
+            subs   = self._listar(client)
+            ativas  = [s for s in subs if s.ativa and s.evento == evento]
+            corretas = [s for s in ativas if s.endpoint == self._url_publica]
+
+            if corretas:
+                logger.info(
+                    "Subscrição %s já ativa (id=%d, endpoint=%s).",
+                    label, corretas[0].id, corretas[0].endpoint,
+                )
+                return True
+
+            for s in ativas:
+                logger.warning(
+                    "Subscrição %s com endpoint incorreto '%s' (id=%d). Removendo...",
+                    label, s.endpoint, s.id,
+                )
+                self._deletar(client, s.id)
+
+            logger.info("Criando subscrição %s para evento %s...", label, evento)
+            nova = self._criar_evento(client, evento)
+            if nova:
+                logger.info("Subscrição %s criada (id=%d).", label, nova.id)
+                return True
+
+            logger.error("Falha ao criar subscrição %s.", label)
+            return False
+
     def verificar_falhas(self) -> list[dict]:
         """Retorna falhas recentes de entrega (últimas 24h)."""
         with SiscomexClient() as client:
@@ -149,8 +210,11 @@ class WebhookManager:
             return []
 
     def _criar(self, client: SiscomexClient) -> Subscricao | None:
+        return self._criar_evento(client, EVENTO_LPCO)
+
+    def _criar_evento(self, client: SiscomexClient, evento: str) -> Subscricao | None:
         payload: dict[str, Any] = {
-            "evento": EVENTO_LPCO,
+            "evento": evento,
             "endpoint": self._url_publica,
             "chaveSecreta": config.WEBHOOK_SECRET,
         }
@@ -162,7 +226,7 @@ class WebhookManager:
                 endpoint=resp["endpoint"],  # type: ignore[index]
             )
         except requests.HTTPError as exc:
-            logger.error("Erro ao criar subscrição: HTTP %s — %s", exc.response.status_code, exc.response.text[:200])
+            logger.error("Erro ao criar subscrição '%s': HTTP %s — %s", evento, exc.response.status_code, exc.response.text[:200])
             return None
 
     def _deletar(self, client: SiscomexClient, subscricao_id: int) -> None:

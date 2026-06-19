@@ -91,6 +91,10 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Subscrição DUE — independente, não bloqueia inicialização se falhar
+    if not mgr.garantir_subscricao_due():
+        logger.warning("Subscrição DUE não registrada — eventos DUE não serão recebidos.")
+
     # 4. Agenda jobs periódicos
     scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
     scheduler.add_job(

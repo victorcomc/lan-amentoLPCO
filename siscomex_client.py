@@ -362,6 +362,44 @@ class SiscomexClient:
         """GET /talpco/api/ext/lpco/{numero}/historico"""
         return self._get(self._LPCO_HISTORICO.format(numero=numero))  # type: ignore[return-value]
 
+    def consultar_due(self, numero: str) -> dict:
+        """
+        Tenta obter os detalhes de uma DUE experimentando múltiplos endpoints.
+        Retorna o primeiro que responder 200, ou dict vazio se nenhum funcionar.
+        O endpoint correto será descoberto na primeira chamada real e logado.
+        """
+        candidatos = [
+            f"/exportacao/api/ext/due/{numero}",
+            f"/exportacao/api/ext/due/{numero}/detalhes",
+            f"/due/api/ext/due/{numero}",
+            f"/exportacao/api/ext/due?numeroDUE={numero}",
+            f"/exportacao/api/ext/due?numero={numero}",
+            f"/due/api/ext/due?numeroDUE={numero}",
+        ]
+        for path in candidatos:
+            try:
+                dados = self._get(path)
+                logger.info("DUE %s: endpoint funcionou → %s", numero, path)
+                return dados if isinstance(dados, dict) else {"items": dados}
+            except requests.HTTPError as exc:
+                code = exc.response.status_code
+                logger.debug("DUE %s: %s → HTTP %d", numero, path, code)
+                if code == 400:
+                    # endpoint existe mas parâmetro errado — loga body para análise
+                    logger.info(
+                        "DUE %s: 400 em %s — body: %s", numero, path,
+                        exc.response.text[:300],
+                    )
+            except Exception as exc:
+                logger.debug("DUE %s: %s → %s", numero, path, exc)
+
+        logger.warning(
+            "DUE %s: nenhum endpoint respondeu 200. "
+            "Quando o primeiro evento real chegar, verifique o log acima.",
+            numero,
+        )
+        return {}
+
     # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------
