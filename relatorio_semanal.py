@@ -1,16 +1,15 @@
 """
-Relatório semanal de LPCOs — módulo independente, não altera o sistema de webhooks.
+Relatório semanal — módulo independente, não altera o sistema de webhooks.
 
-Fluxo:
-  1. Pagina GET /talpco/api/ext/lpco/consulta com o certificado SE até esgotar resultados
-  2. Repete com o certificado NE, complementando os LPCOs que SE não retornou
-  3. Para cada LPCO encontrado chama detalhar_lpco() para obter todos os campos disponíveis
-  4. Gera Excel com duas abas:
-       "Resumo por Cliente"  — totais agrupados por CNPJ/empresa
-       "Detalhe LPCO"        — um LPCO por linha com todos os campos disponíveis
-  5. Envia o arquivo por email como anexo
+Abas geradas no Excel:
+  1. "Resumo por Cliente (LPCO)"   — totais por CNPJ: LPCOs, peso, produtos, destinos, situações
+  2. "Detalhe LPCO"                — uma linha por LPCO, todos os campos disponíveis
+  3. "Resumo Mercado (DUEs)"       — totais por exportador: DUEs, peso, FOB, destinos
+  4. "Detalhe DUEs"                — uma linha por evento DUE recebido
+  5. "Análise de Mercado"          — rankings: top exportadores, destinos, produtos, modais
+  6. "Legenda"                     — referência de cores por situação
 
-Agendamento padrão: toda segunda-feira às 08:00 (configurável em main.py).
+Agendamento padrão: toda sexta-feira às 14:00 (configurável em main.py).
 """
 
 import logging
@@ -26,63 +25,57 @@ from siscomex_client import SiscomexClient
 
 logger = logging.getLogger(__name__)
 
-# Pausa entre chamadas à API para não sobrecarregar o servidor do Portal Único
-_DELAY_ENTRE_CHAMADAS = 0.4  # segundos
+_DELAY_ENTRE_CHAMADAS = 0.4
 _TAMANHO_PAGINA = 50
+
+_CORES_SITUACAO = {
+    "DEFERIDO":         "C6EFCE",
+    "INDEFERIDO":       "FFC7CE",
+    "EM_ANALISE":       "FFEB9C",
+    "EM_VERIFICACAO":   "DDEBF7",
+    "CANCELADO":        "D9D9D9",
+    "VENCIDO":          "F2DCDB",
+    "SUSPENSAO":        "E2EFDA",
+}
+
+_MODELOS = {
+    "E00061": "Pesca",
+    "E00144": "Fruta",
+}
 
 
 # ---------------------------------------------------------------------------
-# Descoberta e detalhe via API (sem filtro de banco)
+# Descoberta e detalhe via API
 # ---------------------------------------------------------------------------
 
 def _paginar_lpcos(client: SiscomexClient, label: str) -> list[str]:
-    """
-    Pagina o endpoint /consulta autenticado até esgotar os resultados.
-    Retorna lista de números de LPCO encontrados.
-    """
     numeros: list[str] = []
     pagina = 1
-
     while True:
         resultado = client.buscar_lpcos(pagina=pagina, tamanho=_TAMANHO_PAGINA)
         if not resultado.sucesso or not resultado.registros:
             if pagina == 1 and not resultado.sucesso:
                 logger.warning("Falha na paginação %s: %s", label, resultado.erro)
             break
-
         for r in resultado.registros:
             if r.numero:
                 numeros.append(r.numero)
-
-        logger.info(
-            "%s: página %d — %d LPCOs (total acumulado: %d)",
-            label, pagina, len(resultado.registros), len(numeros),
-        )
-
+        logger.info("%s: página %d — %d LPCOs (acumulado: %d)", label, pagina, len(resultado.registros), len(numeros))
         if len(resultado.registros) < _TAMANHO_PAGINA:
-            break  # última página
-
+            break
         pagina += 1
         time.sleep(_DELAY_ENTRE_CHAMADAS)
-
     return numeros
 
 
 def _detalhar_em_sessao(
     numeros: list[str],
-    pfx_path: str,
-    pfx_base64: str,
-    pfx_password: str,
+    pfx_path: str, pfx_base64: str, pfx_password: str,
     label: str,
 ) -> dict[str, dict]:
-    """
-    Autentica com um certificado, pagina /consulta para descobrir TODOS os LPCOs
-    acessíveis e detalha cada um. Retorna {numero: raw_dict}.
-    """
     resultado: dict[str, dict] = {}
     if not (pfx_path or pfx_base64):
         return resultado
-
     try:
         with SiscomexClient(
             cert_pfx_path=pfx_path,
@@ -90,76 +83,47 @@ def _detalhar_em_sessao(
             cert_pfx_password=pfx_password,
         ) as client:
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
-                logger.error("Autenticação %s falhou para relatório semanal.", label)
+                logger.error("Autenticação %s falhou para relatório.", label)
                 return resultado
-
-            # Descobre quais LPCOs este certificado enxerga
             encontrados = _paginar_lpcos(client, label)
-
-            # Remove os que já temos dados (passados como "numeros" = já detalhados por outro cert)
             pendentes = [n for n in encontrados if n not in numeros]
-            logger.info(
-                "%s: %d LPCOs encontrados, %d novos para detalhar.",
-                label, len(encontrados), len(pendentes),
-            )
-
+            logger.info("%s: %d encontrados, %d novos para detalhar.", label, len(encontrados), len(pendentes))
             for i, numero in enumerate(pendentes, start=1):
                 try:
                     raw = client.detalhar_lpco(numero)
                     resultado[numero] = raw if isinstance(raw, dict) else {}
                 except Exception as exc:
-                    logger.debug("%s: detalhe de %s — %s", label, numero, exc)
+                    logger.debug("%s: detalhe %s — %s", label, numero, exc)
                     resultado[numero] = {}
-
                 if i % 50 == 0:
                     logger.info("  %s: %d/%d detalhes obtidos.", label, i, len(pendentes))
-
                 time.sleep(_DELAY_ENTRE_CHAMADAS)
-
     except Exception as exc:
         logger.error("Erro na sessão %s: %s", label, exc)
-
     return resultado
 
 
 def _buscar_todos_detalhes() -> dict[str, dict]:
-    """
-    Descoberta completa: usa certificado SE e NE para varrer todos os LPCOs
-    acessíveis a partir dos dois certificados (sem filtro do banco de dados).
-    Retorna {numero_lpco: raw_dict_detalhe}.
-    """
-    # SE — descobre e detalha todos
     detalhes = _detalhar_em_sessao(
-        numeros=[],           # nenhum pré-conhecido → detalha tudo que encontrar
-        pfx_path=config.CERT_PFX_PATH,
-        pfx_base64=config.CERT_PFX_BASE64,
-        pfx_password=config.CERT_PFX_PASSWORD,
-        label="SE",
+        numeros=[],
+        pfx_path=config.CERT_PFX_PATH, pfx_base64=config.CERT_PFX_BASE64,
+        pfx_password=config.CERT_PFX_PASSWORD, label="SE",
     )
-
-    # NE — complementa com LPCOs que SE não enxergou
     if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
-        ja_temos = list(detalhes.keys())
         ne = _detalhar_em_sessao(
-            numeros=ja_temos,     # evita redetalhar o que SE já trouxe
-            pfx_path=config.CERT_NE_PFX_PATH,
-            pfx_base64=config.CERT_NE_PFX_BASE64,
-            pfx_password=config.CERT_NE_PFX_PASSWORD,
-            label="NE",
+            numeros=list(detalhes.keys()),
+            pfx_path=config.CERT_NE_PFX_PATH, pfx_base64=config.CERT_NE_PFX_BASE64,
+            pfx_password=config.CERT_NE_PFX_PASSWORD, label="NE",
         )
         detalhes.update(ne)
-    else:
-        logger.info("Certificado NE não configurado — relatório apenas com dados SE.")
-
     return detalhes
 
 
 # ---------------------------------------------------------------------------
-# Parsing do response bruto
+# Parsing
 # ---------------------------------------------------------------------------
 
 def _get_nested(raw: dict, *chaves: str) -> Any:
-    """Tenta múltiplas chaves (suporta notação 'pai.filho'). Retorna o primeiro não-vazio."""
     for chave in chaves:
         v: Any = raw
         for parte in chave.split("."):
@@ -173,10 +137,6 @@ def _get_nested(raw: dict, *chaves: str) -> Any:
 
 
 def _extrair_campos(numero: str, raw: dict) -> dict:
-    """
-    Extrai campos relevantes do response bruto do detalhe do LPCO.
-    Usa múltiplos nomes de campo para acomodar variações da API.
-    """
     requerente = (
         raw.get("requerente") or raw.get("importador") or
         raw.get("exportador") or raw.get("solicitante") or {}
@@ -185,9 +145,11 @@ def _extrair_campos(numero: str, raw: dict) -> dict:
         raw.get("mercadoria") or raw.get("produto") or
         raw.get("item") or raw.get("dadosMercadoria") or {}
     )
-    situacao_obj = raw.get("situacao") if isinstance(raw.get("situacao"), dict) else {}
-    pais_obj     = raw.get("paisDestino") or raw.get("pais") or raw.get("paisDeDestino") or {}
-    porto_obj    = raw.get("portoEmbarque") or raw.get("porto") or raw.get("localEmbarque") or {}
+    situacao_obj   = raw.get("situacao") if isinstance(raw.get("situacao"), dict) else {}
+    pais_obj       = raw.get("paisDestino") or raw.get("pais") or raw.get("paisDeDestino") or {}
+    porto_obj      = raw.get("portoEmbarque") or raw.get("porto") or raw.get("localEmbarque") or {}
+    orgao_obj      = raw.get("orgaoAnuente") or raw.get("orgao") or {}
+    transporte_obj = raw.get("modoTransporte") or raw.get("transporte") or {}
 
     cnpj = (
         _get_nested(requerente, "cpfCnpj", "cnpj", "cpf") or
@@ -207,45 +169,66 @@ def _extrair_campos(numero: str, raw: dict) -> dict:
     except (ValueError, TypeError):
         quantidade = 0.0
 
+    qtd_utilizada_raw = (
+        _get_nested(mercadoria, "quantidadeUtilizada", "qtdUtilizada") or
+        _get_nested(raw, "quantidadeUtilizada", "qtdUtilizada")
+    )
+    try:
+        qtd_utilizada = float(qtd_utilizada_raw) if qtd_utilizada_raw else 0.0
+    except (ValueError, TypeError):
+        qtd_utilizada = 0.0
+
     sit_id   = (
         _get_nested(situacao_obj, "id", "codigo") or
         (raw.get("situacao") if isinstance(raw.get("situacao"), str) else "") or ""
     )
     sit_desc = _get_nested(situacao_obj, "descricao", "nome") or ""
 
-    pais_desc  = _get_nested(pais_obj, "descricao", "nome") or (pais_obj if isinstance(pais_obj, str) else "")
-    porto_desc = _get_nested(porto_obj, "descricao", "nome") or (porto_obj if isinstance(porto_obj, str) else "")
+    pais_desc    = _get_nested(pais_obj, "descricao", "nome") or (pais_obj if isinstance(pais_obj, str) else "")
+    porto_desc   = _get_nested(porto_obj, "descricao", "nome") or (porto_obj if isinstance(porto_obj, str) else "")
+    orgao_desc   = _get_nested(orgao_obj, "descricao", "nome", "sigla") or (orgao_obj if isinstance(orgao_obj, str) else "")
+    modal_desc   = _get_nested(transporte_obj, "descricao", "nome") or (transporte_obj if isinstance(transporte_obj, str) else "")
+
+    modelo = _get_nested(raw, "codigoModelo", "modelo", "tipoLpco")
+
+    # Saldo = autorizado - utilizado (se ambos disponíveis)
+    saldo_raw = _get_nested(mercadoria, "saldo", "quantidadeSaldo") or _get_nested(raw, "saldo", "quantidadeSaldo")
+    try:
+        saldo = float(saldo_raw) if saldo_raw else (quantidade - qtd_utilizada if qtd_utilizada else None)
+    except (ValueError, TypeError):
+        saldo = None
 
     return {
-        "numero_lpco":       numero,
-        "cnpj":              cnpj,
-        "nome_empresa":      nome,
-        "codigo_modelo":     _get_nested(raw, "codigoModelo", "modelo", "tipoLpco"),
-        "ncm":               _get_nested(mercadoria, "ncm", "codigoNcm") or _get_nested(raw, "ncm", "codigoNcm"),
-        "descricao_produto": _get_nested(mercadoria, "descricao", "descricaoNcm", "nome") or _get_nested(raw, "descricaoProduto"),
-        "quantidade":        quantidade,
-        "unidade":           _get_nested(mercadoria, "unidade", "siglaUnidade") or _get_nested(raw, "unidade"),
-        "pais_destino":      pais_desc,
-        "porto_embarque":    porto_desc,
-        "embarcacao":        _get_nested(raw, "embarcacao", "nomeEmbarcacao", "navio"),
-        "data_validade":     _get_nested(raw, "dataValidade", "validade", "dtValidade"),
-        "situacao_id":       sit_id.upper() if sit_id else "",
-        "situacao_desc":     sit_desc,
+        "numero_lpco":        numero,
+        "cnpj":               cnpj,
+        "nome_empresa":       nome,
+        "uf":                 _get_nested(requerente, "uf", "estado", "siglaUf") or _get_nested(raw, "uf"),
+        "municipio":          _get_nested(requerente, "municipio", "cidade") or _get_nested(raw, "municipio"),
+        "codigo_modelo":      modelo,
+        "tipo_lpco":          _MODELOS.get(str(modelo), modelo),
+        "orgao_anuente":      orgao_desc,
+        "ncm":                _get_nested(mercadoria, "ncm", "codigoNcm") or _get_nested(raw, "ncm", "codigoNcm"),
+        "descricao_produto":  _get_nested(mercadoria, "descricao", "descricaoNcm", "nome") or _get_nested(raw, "descricaoProduto"),
+        "quantidade":         quantidade,
+        "qtd_utilizada":      qtd_utilizada,
+        "saldo":              saldo,
+        "unidade":            _get_nested(mercadoria, "unidade", "siglaUnidade") or _get_nested(raw, "unidade"),
+        "pais_destino":       pais_desc,
+        "porto_embarque":     porto_desc,
+        "embarcacao":         _get_nested(raw, "embarcacao", "nomeEmbarcacao", "navio"),
+        "modal_transporte":   modal_desc,
+        "data_emissao":       _get_nested(raw, "dataEmissao", "dataAbertura", "dtEmissao"),
+        "data_validade":      _get_nested(raw, "dataValidade", "validade", "dtValidade"),
+        "situacao_id":        sit_id.upper() if sit_id else "",
+        "situacao_desc":      sit_desc,
+        "numero_processo":    _get_nested(raw, "numeroProcesso", "processo", "numProcesso"),
+        "numero_di_due":      _get_nested(raw, "numeroDUE", "numeroDI", "numDUE", "numDI"),
     }
 
 
 # ---------------------------------------------------------------------------
-# Geração do Excel
+# Helpers de formatação Excel
 # ---------------------------------------------------------------------------
-
-_CORES_SITUACAO = {
-    "DEFERIDO":         "C6EFCE",
-    "INDEFERIDO":       "FFC7CE",
-    "EM_ANALISE":       "FFEB9C",
-    "EM_VERIFICACAO":   "DDEBF7",
-    "CANCELADO":        "D9D9D9",
-}
-
 
 def _aplicar_cabecalho(ws: Any, titulos: list[str], cor_hex: str = "1F4E79") -> None:
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -253,8 +236,8 @@ def _aplicar_cabecalho(ws: Any, titulos: list[str], cor_hex: str = "1F4E79") -> 
     fill  = PatternFill("solid", fgColor=cor_hex)
     fonte = Font(bold=True, color="FFFFFF", size=11)
     for cell in ws[1]:
-        cell.fill  = fill
-        cell.font  = fonte
+        cell.fill      = fill
+        cell.font      = fonte
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
 
 
@@ -265,31 +248,37 @@ def _ajustar_colunas(ws: Any) -> None:
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(largura + 4, 55)
 
 
-def _gerar_excel(dados: list[dict], periodo_label: str) -> bytes:
-    try:
-        import openpyxl
-        from openpyxl.styles import PatternFill
-    except ImportError:
-        raise RuntimeError("openpyxl não instalado — execute: pip install openpyxl")
+def _linha_titulo_secao(ws: Any, texto: str, ncols: int) -> None:
+    """Insere linha com fundo cinza como separador visual."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    ws.append([texto] + [""] * (ncols - 1))
+    row = ws.max_row
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=min(ncols, ws.max_column or ncols))
+    cell = ws.cell(row=row, column=1)
+    cell.font      = Font(bold=True, size=12, color="1F4E79")
+    cell.fill      = PatternFill("solid", fgColor="D9E1F2")
+    cell.alignment = Alignment(horizontal="left")
 
-    wb = openpyxl.Workbook()
 
-    # -----------------------------------------------------------------------
-    # Aba 1 — Resumo por Cliente
-    # -----------------------------------------------------------------------
-    ws1 = wb.active
-    ws1.title = "Resumo por Cliente"
+def _top_n(contador: dict, n: int = 10) -> list[tuple]:
+    return sorted(contador.items(), key=lambda x: -x[1])[:n]
+
+
+# ---------------------------------------------------------------------------
+# Aba 1 — Resumo por Cliente (LPCO)
+# ---------------------------------------------------------------------------
+
+def _aba_resumo_clientes(wb: Any, dados: list[dict]) -> None:
+    from openpyxl.styles import Alignment
+    ws = wb.active
+    ws.title = "Resumo por Cliente (LPCO)"
 
     clientes: dict[str, dict] = defaultdict(lambda: {
-        "nome": "",
-        "lpcos": set(),
-        "total_kg": 0.0,
-        "unidades": set(),
-        "produtos": set(),
-        "paises": set(),
-        "portos": set(),
-        "embarcacoes": set(),
-        "situacoes": defaultdict(int),
+        "nome": "", "uf": "", "municipio": "",
+        "lpcos": set(), "total_kg": 0.0, "utilizado_kg": 0.0,
+        "unidades": set(), "modelos": set(), "produtos": set(),
+        "ncms": set(), "paises": set(), "portos": set(),
+        "embarcacoes": set(), "modais": set(), "situacoes": defaultdict(int),
     })
 
     for d in dados:
@@ -297,56 +286,79 @@ def _gerar_excel(dados: list[dict], periodo_label: str) -> bytes:
         c = clientes[chave]
         if d["nome_empresa"]:
             c["nome"] = d["nome_empresa"]
+        if d["uf"]:
+            c["uf"] = d["uf"]
+        if d["municipio"]:
+            c["municipio"] = d["municipio"]
         c["lpcos"].add(d["numero_lpco"])
         c["total_kg"] += d["quantidade"]
+        if d["qtd_utilizada"]:
+            c["utilizado_kg"] += d["qtd_utilizada"]
         for campo, dest in [
-            ("unidade", "unidades"),
-            ("descricao_produto", "produtos"),
-            ("pais_destino", "paises"),
-            ("porto_embarque", "portos"),
-            ("embarcacao", "embarcacoes"),
+            ("unidade",          "unidades"),
+            ("tipo_lpco",        "modelos"),
+            ("descricao_produto","produtos"),
+            ("ncm",              "ncms"),
+            ("pais_destino",     "paises"),
+            ("porto_embarque",   "portos"),
+            ("embarcacao",       "embarcacoes"),
+            ("modal_transporte", "modais"),
         ]:
-            if d[campo]:
+            if d.get(campo):
                 c[dest].add(d[campo])
         c["situacoes"][d["situacao_id"] or "SEM_INFO"] += 1
 
-    _aplicar_cabecalho(ws1, [
-        "CNPJ / CPF", "Nome Empresa", "Total LPCOs",
-        "Qtd. Total Autorizada", "Unidade",
-        "Produtos / Espécies", "Países Destino",
-        "Portos Embarque", "Embarcações", "Situações",
+    _aplicar_cabecalho(ws, [
+        "CNPJ / CPF", "Nome Empresa", "UF", "Município",
+        "Total LPCOs", "Qtd. Autorizada (Total)", "Qtd. Utilizada (Total)", "Unidade",
+        "Modelos (Tipo LPCO)", "NCMs", "Produtos / Espécies",
+        "Países Destino", "Portos Embarque", "Embarcações", "Modais de Transporte",
+        "Situações",
     ])
 
     for cnpj, c in sorted(clientes.items(), key=lambda x: -len(x[1]["lpcos"])):
-        sits_str = "   ".join(f"{k}: {v}" for k, v in sorted(c["situacoes"].items()))
-        ws1.append([
-            cnpj,
-            c["nome"],
+        sits_str = "  ".join(f"{k}:{v}" for k, v in sorted(c["situacoes"].items()))
+        util_pct = ""
+        if c["total_kg"] and c["utilizado_kg"]:
+            util_pct = f"{c['utilizado_kg']:.1f} ({100*c['utilizado_kg']/c['total_kg']:.0f}%)"
+        ws.append([
+            cnpj, c["nome"], c["uf"], c["municipio"],
             len(c["lpcos"]),
             round(c["total_kg"], 3) if c["total_kg"] else "",
+            util_pct,
             " | ".join(sorted(c["unidades"])),
+            " | ".join(sorted(c["modelos"])),
+            " | ".join(sorted(c["ncms"])),
             " | ".join(sorted(c["produtos"])),
             " | ".join(sorted(c["paises"])),
             " | ".join(sorted(c["portos"])),
             " | ".join(sorted(c["embarcacoes"])),
+            " | ".join(sorted(c["modais"])),
             sits_str,
         ])
 
-    _ajustar_colunas(ws1)
-    ws1.freeze_panes = "A2"
-    ws1.auto_filter.ref = ws1.dimensions
+    _ajustar_colunas(ws)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
-    # -----------------------------------------------------------------------
-    # Aba 2 — Detalhe por LPCO
-    # -----------------------------------------------------------------------
-    ws2 = wb.create_sheet("Detalhe LPCO")
 
-    _aplicar_cabecalho(ws2, [
-        "Número LPCO", "CNPJ / CPF", "Nome Empresa",
-        "Código Modelo", "NCM", "Produto / Espécie",
-        "Qtd. Autorizada", "Unidade",
-        "País Destino", "Porto Embarque", "Embarcação",
-        "Validade", "Situação",
+# ---------------------------------------------------------------------------
+# Aba 2 — Detalhe LPCO
+# ---------------------------------------------------------------------------
+
+def _aba_detalhe_lpco(wb: Any, dados: list[dict]) -> None:
+    from openpyxl.styles import PatternFill
+    ws = wb.create_sheet("Detalhe LPCO")
+
+    _aplicar_cabecalho(ws, [
+        "Número LPCO", "CNPJ / CPF", "Nome Empresa", "UF", "Município",
+        "Modelo", "Tipo", "Órgão Anuente",
+        "NCM", "Produto / Espécie",
+        "Qtd. Autorizada", "Qtd. Utilizada", "Saldo", "Unidade",
+        "País Destino", "Porto Embarque", "Embarcação", "Modal Transporte",
+        "Data Emissão", "Data Validade",
+        "Número Processo", "Número DUE/DI",
+        "Situação",
     ])
 
     for d in sorted(dados, key=lambda x: (x.get("cnpj", ""), x.get("numero_lpco", ""))):
@@ -354,97 +366,66 @@ def _gerar_excel(dados: list[dict], periodo_label: str) -> bytes:
         if d["situacao_desc"]:
             sit_label = f"{d['situacao_id']} — {d['situacao_desc']}"
 
-        ws2.append([
-            d["numero_lpco"], d["cnpj"], d["nome_empresa"],
-            d["codigo_modelo"], d["ncm"], d["descricao_produto"],
-            d["quantidade"] if d["quantidade"] else "", d["unidade"],
-            d["pais_destino"], d["porto_embarque"], d["embarcacao"],
-            d["data_validade"], sit_label,
+        ws.append([
+            d["numero_lpco"], d["cnpj"], d["nome_empresa"], d["uf"], d["municipio"],
+            d["codigo_modelo"], d["tipo_lpco"], d["orgao_anuente"],
+            d["ncm"], d["descricao_produto"],
+            d["quantidade"] or "", d["qtd_utilizada"] or "", d["saldo"] if d["saldo"] is not None else "", d["unidade"],
+            d["pais_destino"], d["porto_embarque"], d["embarcacao"], d["modal_transporte"],
+            d["data_emissao"], d["data_validade"],
+            d["numero_processo"], d["numero_di_due"],
+            sit_label,
         ])
 
         cor = _CORES_SITUACAO.get(d["situacao_id"].upper() if d["situacao_id"] else "", "")
         if cor:
             fill = PatternFill("solid", fgColor=cor)
-            for cell in ws2[ws2.max_row]:
+            for cell in ws[ws.max_row]:
                 cell.fill = fill
 
-    _ajustar_colunas(ws2)
-    ws2.freeze_panes = "A2"
-    ws2.auto_filter.ref = ws2.dimensions
-
-    # -----------------------------------------------------------------------
-    # Aba 3 — Legenda
-    # -----------------------------------------------------------------------
-    ws3 = wb.create_sheet("Legenda")
-    from openpyxl.styles import Font, PatternFill
-    ws3.append(["Cor", "Situação", "Descrição"])
-    for cell in ws3[1]:
-        cell.font = Font(bold=True)
-    legenda = [
-        ("C6EFCE", "DEFERIDO",       "LPCO aprovado pelo órgão anuente"),
-        ("FFC7CE", "INDEFERIDO",      "LPCO negado pelo órgão anuente"),
-        ("FFEB9C", "EM_ANALISE",      "Em análise pelo órgão anuente"),
-        ("DDEBF7", "EM_VERIFICACAO",  "Aguardando verificação/documentação"),
-        ("D9D9D9", "CANCELADO",       "LPCO cancelado"),
-        ("FFFFFF", "Demais",          "Outras situações sem cor específica"),
-    ]
-    for cor, sit, desc in legenda:
-        ws3.append(["", sit, desc])
-        ws3.cell(ws3.max_row, 1).fill = PatternFill("solid", fgColor=cor)
-    from openpyxl.utils import get_column_letter
-    for i, larg in enumerate([8, 25, 45], start=1):
-        ws3.column_dimensions[get_column_letter(i)].width = larg
-
-    wb.properties.description = f"Relatório LPCO Hevile — {periodo_label}"
-    buf = BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    _ajustar_colunas(ws)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
 
-def _adicionar_aba_dues(wb: Any, dues: list[dict]) -> None:
-    """
-    Adiciona duas abas ao workbook com dados de DUEs para pesquisa de mercado.
-    Só é chamada se houver DUEs no período.
-    """
-    try:
-        import openpyxl
-        from openpyxl.styles import Font, PatternFill
-    except ImportError:
-        return
+# ---------------------------------------------------------------------------
+# Aba 3 — Resumo Mercado (DUEs)
+# ---------------------------------------------------------------------------
 
-    # -----------------------------------------------------------------------
-    # Aba: Resumo Mercado (DUEs agrupadas por exportador)
-    # -----------------------------------------------------------------------
-    ws_res = wb.create_sheet("Resumo Mercado (DUEs)")
-    _aplicar_cabecalho(ws_res, [
-        "CNPJ Exportador", "Nome Exportador", "Total DUEs",
+def _aba_resumo_dues(wb: Any, dues: list[dict]) -> None:
+    ws = wb.create_sheet("Resumo Mercado (DUEs)")
+    _aplicar_cabecalho(ws, [
+        "CNPJ Exportador", "Nome Exportador",
+        "Total DUEs", "Total Eventos",
         "Peso Líquido Total (kg)", "Valor FOB Total (USD)",
-        "Produtos (NCM)", "Países Destino",
+        "NCMs / Produtos", "Países Destino",
         "Portos Embarque", "Embarcações", "Tipos de Evento",
-    ], cor_hex="1F4E79")
+    ], cor_hex="375623")
 
     mercado: dict[str, dict] = defaultdict(lambda: {
-        "nome": "",
-        "dues": set(),
-        "peso_kg": 0.0,
-        "fob_usd": 0.0,
-        "ncms": set(),
-        "paises": set(),
-        "portos": set(),
-        "embarcacoes": set(),
-        "tipos": set(),
+        "nome": "", "dues": set(), "eventos": 0,
+        "peso_kg": 0.0, "fob_usd": 0.0,
+        "ncms": set(), "paises": set(), "portos": set(),
+        "embarcacoes": set(), "tipos": set(),
     })
 
     for d in dues:
-        chave = d.get("exportador_cnpj") or d.get("numero_due", "N/I")[:8]
+        chave = d.get("exportador_cnpj") or d.get("numero_due", "N/I")[:12]
         m = mercado[chave]
         if d.get("exportador_nome"):
             m["nome"] = d["exportador_nome"]
         m["dues"].add(d["numero_due"])
+        m["eventos"] += 1
         if d.get("peso_liquido_kg"):
-            m["peso_kg"] += float(d["peso_liquido_kg"])
+            try:
+                m["peso_kg"] += float(d["peso_liquido_kg"])
+            except (TypeError, ValueError):
+                pass
         if d.get("valor_fob_usd"):
-            m["fob_usd"] += float(d["valor_fob_usd"])
+            try:
+                m["fob_usd"] += float(d["valor_fob_usd"])
+            except (TypeError, ValueError):
+                pass
         for campo, dest in [
             ("produto_ncm",    "ncms"),
             ("pais_destino",   "paises"),
@@ -453,13 +434,14 @@ def _adicionar_aba_dues(wb: Any, dues: list[dict]) -> None:
             ("tipo_evento",    "tipos"),
         ]:
             if d.get(campo):
-                m[dest].add(d[campo])
+                m[dest].add(str(d[campo]))
 
     for cnpj, m in sorted(mercado.items(), key=lambda x: -len(x[1]["dues"])):
-        ws_res.append([
+        ws.append([
             cnpj,
-            m["nome"] or "(sem detalhe ainda)",
+            m["nome"] or "(aguardando detalhe API)",
             len(m["dues"]),
+            m["eventos"],
             round(m["peso_kg"], 1) if m["peso_kg"] else "",
             round(m["fob_usd"], 2) if m["fob_usd"] else "",
             " | ".join(sorted(m["ncms"])),
@@ -469,26 +451,32 @@ def _adicionar_aba_dues(wb: Any, dues: list[dict]) -> None:
             " | ".join(sorted(m["tipos"])),
         ])
 
-    _ajustar_colunas(ws_res)
-    ws_res.freeze_panes = "A2"
-    ws_res.auto_filter.ref = ws_res.dimensions
+    _ajustar_colunas(ws)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
-    # -----------------------------------------------------------------------
-    # Aba: Detalhe DUEs (uma linha por evento)
-    # -----------------------------------------------------------------------
-    ws_det = wb.create_sheet("Detalhe DUEs")
-    _aplicar_cabecalho(ws_det, [
-        "Número DUE", "Data Evento", "Tipo Evento", "Descrição",
+
+# ---------------------------------------------------------------------------
+# Aba 4 — Detalhe DUEs
+# ---------------------------------------------------------------------------
+
+def _aba_detalhe_dues(wb: Any, dues: list[dict]) -> None:
+    ws = wb.create_sheet("Detalhe DUEs")
+    _aplicar_cabecalho(ws, [
+        "Número DUE", "Data Evento", "Data Recebido",
+        "Tipo Evento", "Descrição do Evento",
         "Exportador CNPJ", "Exportador Nome",
         "NCM", "Produto / Espécie",
         "Peso Líquido (kg)", "Peso Bruto (kg)", "Valor FOB (USD)",
-        "País Destino", "Porto Embarque", "Embarcação", "RUC",
+        "País Destino", "Porto Embarque", "Embarcação",
+        "RUC",
     ], cor_hex="375623")
 
     for d in sorted(dues, key=lambda x: x.get("data_evento", "")):
-        ws_det.append([
+        ws.append([
             d.get("numero_due", ""),
             d.get("data_evento", ""),
+            d.get("data_recebido", ""),
             d.get("tipo_evento", ""),
             d.get("descricao_evento", ""),
             d.get("exportador_cnpj", ""),
@@ -504,9 +492,199 @@ def _adicionar_aba_dues(wb: Any, dues: list[dict]) -> None:
             d.get("ruc", ""),
         ])
 
-    _ajustar_colunas(ws_det)
-    ws_det.freeze_panes = "A2"
-    ws_det.auto_filter.ref = ws_det.dimensions
+    _ajustar_colunas(ws)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+# ---------------------------------------------------------------------------
+# Aba 5 — Análise de Mercado (rankings combinados)
+# ---------------------------------------------------------------------------
+
+def _aba_analise_mercado(wb: Any, dados_lpco: list[dict], dues: list[dict]) -> None:
+    from openpyxl.styles import Font, PatternFill, Alignment
+    ws = wb.create_sheet("Análise de Mercado")
+
+    ncols = 4
+
+    def _titulo(texto: str) -> None:
+        _linha_titulo_secao(ws, texto, ncols)
+
+    def _cab(*cols: str) -> None:
+        _aplicar_cabecalho(ws, list(cols), cor_hex="4472C4")
+
+    def _separador() -> None:
+        ws.append([""] * ncols)
+
+    # -----------------------------------------------------------------------
+    # LPCO — Rankings
+    # -----------------------------------------------------------------------
+    _titulo("■ LPCO — Rankings do Período")
+    _separador()
+
+    # Top exportadores por número de LPCOs
+    _cab("Rank", "Exportador", "CNPJ", "Qtd. LPCOs")
+    cont_exp: dict[str, dict] = defaultdict(lambda: {"nome": "", "count": 0})
+    for d in dados_lpco:
+        k = d["cnpj"] or "N/I"
+        cont_exp[k]["nome"] = d["nome_empresa"] or cont_exp[k]["nome"]
+        cont_exp[k]["count"] += 1
+    for rank, (cnpj, info) in enumerate(_top_n({k: v["count"] for k, v in cont_exp.items()}, 15), 1):
+        ws.append([rank, cont_exp[cnpj]["nome"], cnpj, info])
+
+    _separador()
+
+    # Top países destino (LPCO)
+    _cab("Rank", "País Destino", "", "Qtd. LPCOs")
+    cont_pais: dict[str, int] = defaultdict(int)
+    for d in dados_lpco:
+        if d["pais_destino"]:
+            cont_pais[d["pais_destino"]] += 1
+    for rank, (pais, qtd) in enumerate(_top_n(cont_pais, 15), 1):
+        ws.append([rank, pais, "", qtd])
+
+    _separador()
+
+    # Top produtos/NCMs (LPCO)
+    _cab("Rank", "NCM", "Produto / Espécie", "Qtd. LPCOs")
+    cont_ncm: dict[str, dict] = defaultdict(lambda: {"desc": "", "count": 0})
+    for d in dados_lpco:
+        k = d["ncm"] or "N/I"
+        cont_ncm[k]["desc"] = d["descricao_produto"] or cont_ncm[k]["desc"]
+        cont_ncm[k]["count"] += 1
+    for rank, (ncm, info) in enumerate(_top_n({k: v["count"] for k, v in cont_ncm.items()}, 15), 1):
+        ws.append([rank, ncm, cont_ncm[ncm]["desc"], info])
+
+    _separador()
+
+    # Top portos de embarque (LPCO)
+    _cab("Rank", "Porto de Embarque", "", "Qtd. LPCOs")
+    cont_porto: dict[str, int] = defaultdict(int)
+    for d in dados_lpco:
+        if d["porto_embarque"]:
+            cont_porto[d["porto_embarque"]] += 1
+    for rank, (porto, qtd) in enumerate(_top_n(cont_porto, 10), 1):
+        ws.append([rank, porto, "", qtd])
+
+    _separador()
+
+    # Distribuição por situação (LPCO)
+    _cab("Situação", "Descrição", "", "Qtd. LPCOs")
+    cont_sit: dict[str, int] = defaultdict(int)
+    for d in dados_lpco:
+        cont_sit[d["situacao_id"] or "SEM_INFO"] += 1
+    for sit, qtd in sorted(cont_sit.items(), key=lambda x: -x[1]):
+        ws.append([sit, "", "", qtd])
+
+    _separador()
+
+    # -----------------------------------------------------------------------
+    # DUE — Rankings de Mercado
+    # -----------------------------------------------------------------------
+    if dues:
+        _titulo("■ DUEs — Pesquisa de Mercado (eventos recebidos via webhook)")
+        _separador()
+
+        # Top exportadores por DUEs
+        _cab("Rank", "Exportador / CNPJ", "Nome", "Total DUEs")
+        cont_due_exp: dict[str, dict] = defaultdict(lambda: {"nome": "", "dues": set()})
+        for d in dues:
+            k = d.get("exportador_cnpj") or d.get("numero_due", "N/I")[:12]
+            cont_due_exp[k]["nome"] = d.get("exportador_nome", "") or cont_due_exp[k]["nome"]
+            cont_due_exp[k]["dues"].add(d["numero_due"])
+        for rank, (cnpj, info) in enumerate(
+            sorted(cont_due_exp.items(), key=lambda x: -len(x[1]["dues"]))[:15], 1
+        ):
+            ws.append([rank, cnpj, info["nome"] or "(sem detalhe)", len(info["dues"])])
+
+        _separador()
+
+        # Top países destino (DUE)
+        _cab("Rank", "País Destino (DUE)", "", "Qtd. DUEs")
+        cont_due_pais: dict[str, int] = defaultdict(int)
+        for d in dues:
+            if d.get("pais_destino"):
+                cont_due_pais[d["pais_destino"]] += 1
+        for rank, (pais, qtd) in enumerate(_top_n(cont_due_pais, 15), 1):
+            ws.append([rank, pais, "", qtd])
+
+        _separador()
+
+        # Top tipos de evento (DUE)
+        _cab("Tipo Evento DUE", "Descrição", "", "Qtd. Eventos")
+        cont_tipo: dict[str, int] = defaultdict(int)
+        for d in dues:
+            cont_tipo[d.get("tipo_evento") or "N/I"] += 1
+        for tipo, qtd in sorted(cont_tipo.items(), key=lambda x: -x[1]):
+            ws.append([tipo, "", "", qtd])
+
+        _separador()
+
+    # -----------------------------------------------------------------------
+    # Resumo geral
+    # -----------------------------------------------------------------------
+    _titulo("■ Totais Gerais")
+    _separador()
+    ws.append(["Total LPCOs no relatório:", len(dados_lpco), "", ""])
+    ws.append(["Total exportadores únicos (LPCO):", len(cont_exp), "", ""])
+    ws.append(["Total DUEs recebidas (período):", len(set(d["numero_due"] for d in dues)) if dues else 0, "", ""])
+    ws.append(["Total exportadores únicos (DUE):", len(cont_due_exp) if dues else 0, "", ""])
+
+    _ajustar_colunas(ws)
+
+
+# ---------------------------------------------------------------------------
+# Aba 6 — Legenda
+# ---------------------------------------------------------------------------
+
+def _aba_legenda(wb: Any) -> None:
+    from openpyxl.styles import Font, PatternFill
+    ws = wb.create_sheet("Legenda")
+    ws.append(["Cor", "Situação LPCO", "Descrição"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    legenda = [
+        ("C6EFCE", "DEFERIDO",      "LPCO aprovado pelo órgão anuente"),
+        ("FFC7CE", "INDEFERIDO",     "LPCO negado pelo órgão anuente"),
+        ("FFEB9C", "EM_ANALISE",     "Em análise pelo órgão anuente"),
+        ("DDEBF7", "EM_VERIFICACAO", "Aguardando verificação/documentação"),
+        ("D9D9D9", "CANCELADO",      "LPCO cancelado"),
+        ("F2DCDB", "VENCIDO",        "LPCO com prazo de validade expirado"),
+        ("E2EFDA", "SUSPENSAO",      "LPCO em suspensão"),
+        ("FFFFFF", "Demais",         "Outras situações sem cor específica"),
+    ]
+    for cor, sit, desc in legenda:
+        ws.append(["", sit, desc])
+        ws.cell(ws.max_row, 1).fill = PatternFill("solid", fgColor=cor)
+    from openpyxl.utils import get_column_letter
+    for i, larg in enumerate([8, 25, 50], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = larg
+
+
+# ---------------------------------------------------------------------------
+# Montagem final do workbook
+# ---------------------------------------------------------------------------
+
+def _gerar_excel_completo(dados_lpco: list[dict], dues: list[dict], periodo_label: str) -> bytes:
+    try:
+        import openpyxl
+    except ImportError:
+        raise RuntimeError("openpyxl não instalado — execute: pip install openpyxl")
+
+    wb = openpyxl.Workbook()
+
+    _aba_resumo_clientes(wb, dados_lpco)
+    _aba_detalhe_lpco(wb, dados_lpco)
+    if dues:
+        _aba_resumo_dues(wb, dues)
+        _aba_detalhe_dues(wb, dues)
+    _aba_analise_mercado(wb, dados_lpco, dues)
+    _aba_legenda(wb)
+
+    wb.properties.description = f"Relatório Mercado Hevile — {periodo_label}"
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -515,59 +693,45 @@ def _adicionar_aba_dues(wb: Any, dues: list[dict]) -> None:
 
 def gerar_e_enviar_relatorio_semanal() -> None:
     """
-    Varre TODOS os LPCOs acessíveis via certificados SE e NE (sem filtro do banco),
-    gera Excel e envia por email. Chamado pelo APScheduler toda segunda às 08:00.
+    Varre TODOS os LPCOs acessíveis via SE e NE (sem filtro do banco),
+    combina com DUEs acumuladas no período e envia Excel por email.
+    Chamado pelo APScheduler toda sexta-feira às 14:00.
     """
     from email_service import enviar_relatorio_excel
 
-    agora    = datetime.now()
-    inicio   = agora - timedelta(days=7)
-    periodo  = f"{inicio.strftime('%d/%m/%Y')} a {agora.strftime('%d/%m/%Y')}"
-    nome_arq = f"relatorio_lpco_{agora.strftime('%Y-%m-%d')}.xlsx"
+    agora   = datetime.now()
+    inicio  = agora - timedelta(days=7)
+    periodo = f"{inicio.strftime('%d/%m/%Y')} a {agora.strftime('%d/%m/%Y')}"
+    nome    = f"relatorio_mercado_{agora.strftime('%Y-%m-%d')}.xlsx"
 
     logger.info("=== Relatório semanal iniciando — período: %s ===", periodo)
 
-    # 1. Descobre e detalha TODOS os LPCOs via API (SE + NE)
-    detalhes = _buscar_todos_detalhes()
+    # 1. LPCOs via API
+    detalhes   = _buscar_todos_detalhes()
     dados_lpco = [_extrair_campos(num, raw) for num, raw in detalhes.items()] if detalhes else []
-    logger.info(
-        "LPCOs encontrados: %d (%d com detalhe completo).",
-        len(detalhes), sum(1 for v in detalhes.values() if v),
-    )
+    logger.info("LPCOs: %d total, %d com detalhe.", len(detalhes), sum(1 for v in detalhes.values() if v))
 
-    # 2. Busca DUEs de mercado acumuladas no banco (semana atual)
-    dues_periodo = listar_dues(
+    # 2. DUEs acumuladas no banco (período da semana)
+    dues = listar_dues(
         data_inicio=inicio.strftime("%Y-%m-%d"),
         data_fim=agora.strftime("%Y-%m-%d"),
     )
-    logger.info("DUEs de mercado no período: %d", len(dues_periodo))
+    logger.info("DUEs no período: %d", len(dues))
 
-    if not dados_lpco and not dues_periodo:
-        logger.error("Sem LPCOs e sem DUEs no período — relatório cancelado.")
+    if not dados_lpco and not dues:
+        logger.error("Sem dados para o relatório — cancelado.")
         return
 
     # 3. Gera Excel
     try:
-        import openpyxl
-        excel_bytes = _gerar_excel(dados_lpco, periodo) if dados_lpco else _gerar_excel([], periodo)
-
-        # Adiciona abas de DUE se houver dados (mesmo que LPCO esteja vazio)
-        if dues_periodo:
-            from io import BytesIO
-            wb = openpyxl.load_workbook(BytesIO(excel_bytes))
-            _adicionar_aba_dues(wb, dues_periodo)
-            buf = BytesIO()
-            wb.save(buf)
-            excel_bytes = buf.getvalue()
-            logger.info("Abas de pesquisa de mercado (DUEs) adicionadas ao Excel.")
-
+        excel_bytes = _gerar_excel_completo(dados_lpco, dues, periodo)
     except Exception as exc:
-        logger.error("Erro ao gerar Excel do relatório semanal: %s", exc)
+        logger.error("Erro ao gerar Excel: %s", exc)
         return
 
     # 4. Envia por email
     try:
-        enviar_relatorio_excel(excel_bytes, nome_arq, periodo)
-        logger.info("=== Relatório semanal enviado: %s ===", nome_arq)
+        enviar_relatorio_excel(excel_bytes, nome, periodo)
+        logger.info("=== Relatório enviado: %s ===", nome)
     except Exception as exc:
-        logger.error("Erro ao enviar relatório semanal por email: %s", exc)
+        logger.error("Erro ao enviar relatório: %s", exc)
