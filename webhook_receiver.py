@@ -199,22 +199,20 @@ def listar_clientes_endpoint():
     return jsonify({"total": len(cnpjs), "cnpjs": cnpjs}), 200
 
 
-@app.route("/relatorio/enviar", methods=["POST"])
+@app.route("/relatorio/enviar", methods=["GET", "POST"])
 def enviar_relatorio_agora():
     """
-    Dispara o relatório semanal imediatamente (sem esperar sexta às 14h).
-    Útil para testes e reenvio sob demanda.
-
-    Header: Secret: <WEBHOOK_SECRET>
+    Dispara o relatório semanal imediatamente.
+    Acesse pelo browser: https://seuservidor.com/relatorio/enviar?secret=VALOR
     """
-    secret = request.headers.get("Secret", "")
+    secret = request.args.get("secret") or request.headers.get("Secret", "")
     if not _secret_valido(secret):
-        return jsonify({"error": "unauthorized"}), 401
+        return "<h2>❌ Secret inválido</h2>", 401
 
     from relatorio_semanal import gerar_e_enviar_relatorio_semanal
     threading.Thread(target=gerar_e_enviar_relatorio_semanal, daemon=True).start()
     logger.info("Relatório semanal disparado manualmente via /relatorio/enviar.")
-    return jsonify({"ok": True, "mensagem": "Relatório em geração — chegará por email em alguns minutos."}), 200
+    return "<h2>✅ Relatório em geração — chegará por email em alguns minutos.</h2>", 200
 
 
 @app.route("/health", methods=["GET"])
