@@ -86,10 +86,19 @@ def init_db() -> None:
                 pais_destino     TEXT,
                 porto_embarque   TEXT,
                 embarcacao       TEXT,
+                situacao_due     TEXT,
+                data_averbacao   TEXT,
+                canal_due        TEXT,
                 payload_json     TEXT,
                 detalhe_json     TEXT
             )
         """)
+        # Adiciona colunas em bancos existentes (não falha se já existirem)
+        for _col, _tipo in [("situacao_due", "TEXT"), ("data_averbacao", "TEXT"), ("canal_due", "TEXT")]:
+            try:
+                conn.execute(f"ALTER TABLE dues_mercado ADD COLUMN {_col} {_tipo}")
+            except Exception:
+                pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_numero     ON dues_mercado (numero_due)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_exportador ON dues_mercado (exportador_cnpj)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_data       ON dues_mercado (data_evento)")
@@ -222,8 +231,9 @@ def registrar_due(dados: dict[str, Any]) -> int:
                  exportador_cnpj, exportador_nome, produto_ncm, produto_desc,
                  peso_liquido_kg, peso_bruto_kg, valor_fob_usd,
                  pais_destino, porto_embarque, embarcacao,
+                 situacao_due, data_averbacao, canal_due,
                  payload_json, detalhe_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 dados.get("data_evento", ""),
@@ -241,6 +251,9 @@ def registrar_due(dados: dict[str, Any]) -> int:
                 dados.get("pais_destino", ""),
                 dados.get("porto_embarque", ""),
                 dados.get("embarcacao", ""),
+                dados.get("situacao_due", ""),
+                dados.get("data_averbacao", ""),
+                dados.get("canal_due", ""),
                 dados.get("payload_json", ""),
                 dados.get("detalhe_json", ""),
             ),

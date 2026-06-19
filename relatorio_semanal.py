@@ -12,6 +12,7 @@ Abas geradas no Excel:
 Agendamento padrão: toda sexta-feira às 14:00 (configurável em main.py).
 """
 
+import json
 import logging
 import time
 from collections import defaultdict
@@ -777,8 +778,8 @@ def _aba_resumo_dues(wb: Any, dues: list[dict]) -> None:
 def _aba_detalhe_dues(wb: Any, dues: list[dict]) -> None:
     ws = wb.create_sheet("Detalhe DUEs")
     _aplicar_cabecalho(ws, [
-        "Número DUE", "Data Evento", "Data Recebido",
-        "Tipo Evento", "Descrição do Evento",
+        "Número DUE", "Data Averbação", "Data Evento", "Data Recebido",
+        "Situação DUE", "Canal", "Tipo Evento", "Descrição do Evento",
         "Exportador CNPJ", "Exportador Nome",
         "NCM", "Produto / Espécie",
         "Peso Líquido (kg)", "Peso Bruto (kg)", "Valor FOB (USD)",
@@ -786,11 +787,14 @@ def _aba_detalhe_dues(wb: Any, dues: list[dict]) -> None:
         "RUC",
     ], cor_hex="375623")
 
-    for d in sorted(dues, key=lambda x: x.get("data_evento", "")):
+    for d in sorted(dues, key=lambda x: x.get("data_averbacao") or x.get("data_evento", "")):
         ws.append([
             d.get("numero_due", ""),
+            d.get("data_averbacao", ""),
             d.get("data_evento", ""),
             d.get("data_recebido", ""),
+            d.get("situacao_due", ""),
+            d.get("canal_due", ""),
             d.get("tipo_evento", ""),
             d.get("descricao_evento", ""),
             d.get("exportador_cnpj", ""),
@@ -1006,6 +1010,80 @@ def _gerar_excel_completo(dados_lpco: list[dict], dues: list[dict], periodo_labe
 # Ponto de entrada do job semanal
 # ---------------------------------------------------------------------------
 
+def _buscar_dues_dos_lpcos(dados_lpco: list[dict]) -> list[dict]:
+    """
+    Para cada LPCO de cliente que tem numero_di_due preenchido,
+    consulta o detalhe da DUE via API e retorna lista compatível com listar_dues().
+
+    Isso captura DUEs históricas dos clientes sem depender do webhook.
+    Usa o certificado SE (Diogenes) para autenticar.
+    """
+    from webhook_receiver import _extrair_campos_due
+
+    numeros_due: set[str] = set()
+    for d in dados_lpco:
+        ref = (d.get("numero_di_due") or "").strip()
+        # Formato DUE: NNAANNNNNNNNNN (14 chars, ex: 26BR0010956873)
+        if ref and len(ref) >= 12:
+            numeros_due.add(ref)
+
+    if not numeros_due:
+        logger.info("Nenhum LPCO de cliente com DUE vinculada encontrado.")
+        return []
+
+    logger.info("Consultando %d DUEs vinculadas a LPCOs de clientes.", len(numeros_due))
+
+    dues: list[dict] = []
+    try:
+        with SiscomexClient(
+            cert_pfx_path=config.CERT_PFX_PATH,
+            cert_pfx_base64=config.CERT_PFX_BASE64,
+            cert_pfx_password=config.CERT_PFX_PASSWORD,
+        ) as client:
+            if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
+                logger.error("Autenticação falhou para busca de DUEs de LPCOs.")
+                return []
+
+            for numero in numeros_due:
+                try:
+                    detalhe = client.consultar_due(numero)
+                    if not detalhe:
+                        continue
+                    campos = _extrair_campos_due(detalhe)
+                    dues.append({
+                        "data_evento":     campos.get("data_averbacao") or detalhe.get("dataDeRegistro", ""),
+                        "data_recebido":   "",
+                        "numero_due":      numero,
+                        "ruc":             detalhe.get("ruc", ""),
+                        "tipo_evento":     "LPCO_VINCULADO",
+                        "descricao_evento": "Consultado via LPCO do cliente",
+                        "exportador_cnpj": campos.get("exportador_cnpj", ""),
+                        "exportador_nome": campos.get("exportador_nome", ""),
+                        "produto_ncm":     campos.get("produto_ncm", ""),
+                        "produto_desc":    campos.get("produto_desc", ""),
+                        "peso_liquido_kg": campos.get("peso_liquido_kg"),
+                        "peso_bruto_kg":   None,
+                        "valor_fob_usd":   campos.get("valor_fob_usd"),
+                        "pais_destino":    campos.get("pais_destino", ""),
+                        "porto_embarque":  campos.get("porto_embarque", ""),
+                        "embarcacao":      "",
+                        "situacao_due":    campos.get("situacao_due", ""),
+                        "data_averbacao":  campos.get("data_averbacao", ""),
+                        "canal_due":       campos.get("canal_due", ""),
+                        "payload_json":    "",
+                        "detalhe_json":    json.dumps(detalhe, ensure_ascii=False),
+                    })
+                    time.sleep(0.2)
+                except Exception as exc:
+                    logger.debug("DUE %s: erro ao consultar — %s", numero, exc)
+
+    except Exception as exc:
+        logger.error("Erro na sessão para busca de DUEs: %s", exc)
+
+    logger.info("DUEs de LPCOs de clientes: %d consultadas com sucesso.", len(dues))
+    return dues
+
+
 def gerar_e_enviar_relatorio_semanal() -> None:
     """
     1. Pagina TODOS os LPCOs visíveis via certificado e filtra pelos CNPJs dos clientes cadastrados.
@@ -1038,12 +1116,22 @@ def gerar_e_enviar_relatorio_semanal() -> None:
         stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), stats_lpco.get("novos", 0),
     )
 
-    # 2. DUEs acumuladas no banco (período da semana)
-    dues = listar_dues(
+    # 2a. DUEs do banco (capturadas via webhook no período)
+    dues_webhook = listar_dues(
         data_inicio=inicio.strftime("%Y-%m-%d"),
         data_fim=agora.strftime("%Y-%m-%d"),
     )
-    logger.info("DUEs no período: %d", len(dues))
+    logger.info("DUEs via webhook (período): %d", len(dues_webhook))
+
+    # 2b. DUEs vinculadas diretamente aos LPCOs dos clientes (via campo numero_di_due)
+    dues_lpco = _buscar_dues_dos_lpcos(dados_lpco)
+    logger.info("DUEs via LPCOs de clientes: %d", len(dues_lpco))
+
+    # Merge sem duplicatas (webhook tem prioridade — dados já enriquecidos)
+    numeros_webhook = {d["numero_due"] for d in dues_webhook}
+    dues_extras = [d for d in dues_lpco if d["numero_due"] not in numeros_webhook]
+    dues = dues_webhook + dues_extras
+    logger.info("DUEs total no relatório: %d (%d webhook + %d via LPCO)", len(dues), len(dues_webhook), len(dues_extras))
 
     if not dados_lpco and not dues:
         logger.error("Sem dados para o relatório — cancelado.")
@@ -1061,7 +1149,9 @@ def gerar_e_enviar_relatorio_semanal() -> None:
         f"Período: {periodo}\n"
         f"LPCOs de clientes: {stats_lpco.get('total', 0)} "
         f"({stats_lpco.get('nossos', 0)} já no SharePoint / {stats_lpco.get('novos', 0)} novos)\n"
-        f"DUEs no período: {len(dues)}\n"
+        f"DUEs via webhook: {len(dues_webhook)}\n"
+        f"DUEs via LPCO vinculado: {len(dues_extras)}\n"
+        f"Total DUEs no relatório: {len(dues)}\n"
         f"CNPJs de clientes buscados: {stats_lpco.get('cnpjs_buscados', 0)}"
     )
     try:

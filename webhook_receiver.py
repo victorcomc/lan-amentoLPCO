@@ -426,26 +426,37 @@ def _extrair_campos_due(detalhe: dict) -> dict:
     """
     Extrai campos da resposta de GET /due/api/ext/due/numero-da-due/{numero}.
 
-    Estrutura real (docs.portalunico.siscomex.gov.br/api/duex/):
-      detalhe.itens[].exportador.numeroDoDocumento  → CNPJ/CPF exportador
-      detalhe.itens[].exportador.nome               → nome exportador
-      detalhe.itens[].ncm.codigo / .descricao       → NCM
-      detalhe.itens[].pesoLiquidoTotal              → peso por item (soma = total)
-      detalhe.itens[].valorDaMercadoriaNaCondicaoDeVenda → FOB por item
-      detalhe.itens[].listaPaisDestino[].nome       → país destino
-      detalhe.itens[].tratamentosAdministrativos[].codigoLPCO → LPCO vinculado
-      detalhe.recintoAduaneiroDeEmbarque.descricao  → porto de embarque
-      detalhe.valorTotalMercadoria                  → FOB total
-      detalhe.paisImportador.nome                   → país importador (fallback)
+    Detecta automaticamente se o payload é DUE completa ou DUEResumida
+    (endpoint consultarDadosResumidosDUE — estrutura diferente).
+
+    DUE completa:
+      itens[].exportador.numero (ou .numeroDoDocumento) → CNPJ exportador
+      itens[].ncm.codigo / .descricao                   → NCM
+      itens[].pesoLiquidoTotal (soma)                   → peso total
+      itens[].listaPaisDestino[].nome                   → país destino
+      recintoAduaneiroDeEmbarque.descricao              → porto
+      valorTotalMercadoria                              → FOB total
+      situacao                                          → status da DUE
+      dataDaAverbacao                                   → data de averbação
+      canal                                             → VERDE/LARANJA/VERMELHO
+
+    DUEResumida:
+      exportadores[].numero → CNPJ exportador
+      situacaoDUE (int)     → código de situação
+      dataSituacaoDUE       → data da situação
     """
+    # Detecta formato DUEResumida pelo campo discriminador
+    if "numeroDUE" in detalhe or ("exportadores" in detalhe and "itens" not in detalhe):
+        return _extrair_campos_due_resumida(detalhe)
+
     itens = detalhe.get("itens") or []
 
-    # Exportador — pega do primeiro item que tiver o campo preenchido
+    # Exportador — schema usa 'numero'; fallback para 'numeroDoDocumento' (versão anterior)
     exportador_cnpj = ""
     exportador_nome = ""
     for item in itens:
         exp = item.get("exportador") or {}
-        doc = exp.get("numeroDoDocumento", "")
+        doc = exp.get("numero") or exp.get("numeroDoDocumento", "")
         if doc:
             exportador_cnpj = doc
             exportador_nome = exp.get("nome", "")
@@ -492,6 +503,59 @@ def _extrair_campos_due(detalhe: dict) -> dict:
         "valor_fob_usd":   round(fob, 2) if fob else None,
         "pais_destino":    pais,
         "porto_embarque":  porto,
+        "situacao_due":    detalhe.get("situacao", ""),
+        "data_averbacao":  detalhe.get("dataDaAverbacao", ""),
+        "canal_due":       detalhe.get("canal", ""),
+    }
+
+
+# Mapeamento de códigos inteiros de situação da DUEResumida para texto legível
+_SITUACOES_DUE_RESUMIDA = {
+    1:  "EM_ELABORACAO",
+    10: "REGISTRADA",
+    11: "CARGA_APRESENTADA_PARA_DESPACHO",
+    15: "ACD_EM_PROCESSAMENTO",
+    20: "LIBERADA_SEM_CONFERENCIA",
+    21: "SELECIONADA_PARA_CONFERENCIA",
+    24: "EMBARQUE_ANTECIPADO_PENDENTE_LPCO",
+    25: "EMBARQUE_ANTECIPADO_AUTORIZADO",
+    26: "EMBARQUE_ANTECIPADO_PENDENTE_AUTORIZACAO",
+    30: "EM_ANALISE_FISCAL",
+    35: "CONCLUIDA_ANALISE_FISCAL",
+    36: "DESEMBARACO_PENDENTE_LPCO",
+    40: "DESEMBARACADA",
+    70: "AVERBADA",
+    80: "CANCELADA_PELO_EXPORTADOR",
+    81: "CANCELADA_POR_EXPIRACAO",
+    82: "CANCELADA_PELA_RFB",
+    83: "CANCELADA_PELA_RFB_A_PEDIDO",
+    86: "INTERROMPIDA",
+}
+
+
+def _extrair_campos_due_resumida(detalhe: dict) -> dict:
+    """
+    Parseia DUEResumida retornada pelo endpoint consultarDadosResumidosDUE.
+    Estrutura completamente diferente da DUE completa.
+    """
+    exportadores = detalhe.get("exportadores") or []
+    exportador_cnpj = exportadores[0].get("numero", "") if exportadores else ""
+
+    sit_int = detalhe.get("situacaoDUE")
+    situacao = _SITUACOES_DUE_RESUMIDA.get(sit_int, str(sit_int) if sit_int is not None else "")
+
+    return {
+        "exportador_cnpj": exportador_cnpj,
+        "exportador_nome": "",
+        "produto_ncm":     "",
+        "produto_desc":    "",
+        "peso_liquido_kg": None,
+        "valor_fob_usd":   None,
+        "pais_destino":    "",
+        "porto_embarque":  "",
+        "situacao_due":    situacao,
+        "data_averbacao":  detalhe.get("dataSituacaoDUE", ""),
+        "canal_due":       "",
     }
 
 
