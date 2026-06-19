@@ -67,6 +67,15 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_numero     ON dues_mercado (numero_due)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_exportador ON dues_mercado (exportador_cnpj)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_data       ON dues_mercado (data_evento)")
+        # CNPJs dos clientes da Hevile — usados para filtrar o relatório semanal
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clientes_cnpj (
+                cnpj       TEXT PRIMARY KEY,
+                nome       TEXT DEFAULT '',
+                ativo      INTEGER DEFAULT 1,
+                data_sync  TEXT DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
     logger.info("Banco de dados inicializado em %s", DB_PATH)
 
@@ -212,3 +221,41 @@ def listar_dues(data_inicio: str = "", data_fim: str = "") -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# CNPJs dos clientes — filtro do relatório semanal
+# ---------------------------------------------------------------------------
+
+def _normalizar_cnpj(cnpj: str) -> str:
+    return "".join(c for c in cnpj if c.isdigit())
+
+
+def registrar_cnpj_cliente(cnpj: str, nome: str = "") -> bool:
+    """Registra CNPJ como cliente ativo. Retorna True se inserido (novo)."""
+    cnpj = _normalizar_cnpj(cnpj)
+    if not cnpj:
+        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT OR REPLACE INTO clientes_cnpj (cnpj, nome, ativo) VALUES (?, ?, 1)",
+            (cnpj, nome),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def listar_cnpjs_clientes() -> set[str]:
+    """Retorna conjunto de CNPJs ativos (só dígitos)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT cnpj FROM clientes_cnpj WHERE ativo = 1"
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
+def total_clientes_cnpj() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM clientes_cnpj WHERE ativo = 1"
+        ).fetchone()[0]

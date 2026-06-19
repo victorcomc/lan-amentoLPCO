@@ -24,6 +24,7 @@ from config import config
 from database import (
     lpco_conhecido, registrar_lpco, registrar_evento, listar_eventos,
     registrar_due, atualizar_due_detalhe,
+    registrar_cnpj_cliente, listar_cnpjs_clientes, total_clientes_cnpj,
 )
 from email_service import notificar_lpco_liberado, notificar_falha_webhook
 
@@ -150,6 +151,52 @@ def relatorio_csv():
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="relatorio_lpco_{sufixo}.csv"'},
     )
+
+
+@app.route("/cliente/registrar", methods=["POST"])
+def registrar_cliente_endpoint():
+    """
+    Registra um ou mais CNPJs de clientes para filtro do relatório semanal.
+
+    Body JSON — um CNPJ:
+        {"cnpj": "12345678000199", "nome": "Empresa X"}
+
+    Body JSON — lista:
+        {"clientes": [{"cnpj": "...", "nome": "..."}, ...]}
+
+    Header: Secret: <WEBHOOK_SECRET>
+    """
+    secret = request.headers.get("Secret", "")
+    if not _secret_valido(secret):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    inseridos = 0
+
+    # aceita lista ou item único
+    clientes = data.get("clientes") or (
+        [{"cnpj": data["cnpj"], "nome": data.get("nome", "")}] if data.get("cnpj") else []
+    )
+
+    for item in clientes:
+        cnpj = str(item.get("cnpj", "")).strip()
+        nome = str(item.get("nome", "")).strip()
+        if registrar_cnpj_cliente(cnpj, nome):
+            inseridos += 1
+
+    total = total_clientes_cnpj()
+    logger.info("CNPJs clientes: %d inseridos. Total ativo: %d.", inseridos, total)
+    return jsonify({"ok": True, "inseridos": inseridos, "total_clientes": total}), 200
+
+
+@app.route("/cliente/listar", methods=["GET"])
+def listar_clientes_endpoint():
+    """Lista todos os CNPJs de clientes cadastrados."""
+    secret = request.headers.get("Secret", "")
+    if not _secret_valido(secret):
+        return jsonify({"error": "unauthorized"}), 401
+    cnpjs = sorted(listar_cnpjs_clientes())
+    return jsonify({"total": len(cnpjs), "cnpjs": cnpjs}), 200
 
 
 @app.route("/health", methods=["GET"])

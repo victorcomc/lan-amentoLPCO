@@ -20,7 +20,7 @@ from io import BytesIO
 from typing import Any
 
 from config import config
-from database import listar_dues
+from database import listar_dues, listar_cnpjs_clientes, total_clientes_cnpj
 from siscomex_client import SiscomexClient
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,22 @@ _MODELOS = {
 # Descoberta e detalhe via API
 # ---------------------------------------------------------------------------
 
-def _paginar_lpcos(client: SiscomexClient, label: str) -> list[str]:
+def _paginar_lpcos(
+    client: SiscomexClient,
+    label: str,
+    data_inicio: str = "",
+    data_fim: str = "",
+) -> list[str]:
+    """Pagina /consulta com filtro de data para limitar ao período do relatório."""
     numeros: list[str] = []
     pagina = 1
     while True:
-        resultado = client.buscar_lpcos(pagina=pagina, tamanho=_TAMANHO_PAGINA)
+        resultado = client.buscar_lpcos(
+            pagina=pagina,
+            tamanho=_TAMANHO_PAGINA,
+            data_inicio=data_inicio or None,
+            data_fim=data_fim or None,
+        )
         if not resultado.sucesso or not resultado.registros:
             if pagina == 1 and not resultado.sucesso:
                 logger.warning("Falha na paginação %s: %s", label, resultado.erro)
@@ -69,10 +80,17 @@ def _paginar_lpcos(client: SiscomexClient, label: str) -> list[str]:
 
 
 def _detalhar_em_sessao(
-    numeros: list[str],
+    ja_detalhados: list[str],
     pfx_path: str, pfx_base64: str, pfx_password: str,
     label: str,
+    data_inicio: str = "",
+    data_fim: str = "",
+    cnpjs_clientes: set | None = None,
 ) -> dict[str, dict]:
+    """
+    Pagina /consulta filtrando por data, detalha cada LPCO encontrado e,
+    se cnpjs_clientes estiver preenchido, descarta LPCOs de outros CNPJs.
+    """
     resultado: dict[str, dict] = {}
     if not (pfx_path or pfx_base64):
         return resultado
@@ -85,35 +103,73 @@ def _detalhar_em_sessao(
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
                 logger.error("Autenticação %s falhou para relatório.", label)
                 return resultado
-            encontrados = _paginar_lpcos(client, label)
-            pendentes = [n for n in encontrados if n not in numeros]
-            logger.info("%s: %d encontrados, %d novos para detalhar.", label, len(encontrados), len(pendentes))
+
+            encontrados = _paginar_lpcos(client, label, data_inicio, data_fim)
+            pendentes = [n for n in encontrados if n not in ja_detalhados]
+            logger.info("%s: %d encontrados no período, %d novos para detalhar.", label, len(encontrados), len(pendentes))
+
+            filtrados = 0
             for i, numero in enumerate(pendentes, start=1):
                 try:
                     raw = client.detalhar_lpco(numero)
-                    resultado[numero] = raw if isinstance(raw, dict) else {}
+                    raw = raw if isinstance(raw, dict) else {}
                 except Exception as exc:
                     logger.debug("%s: detalhe %s — %s", label, numero, exc)
-                    resultado[numero] = {}
+                    raw = {}
+
+                # Filtro por CNPJ do cliente
+                if cnpjs_clientes:
+                    campos = _extrair_campos(numero, raw)
+                    cnpj_lpco = "".join(c for c in (campos.get("cnpj") or "") if c.isdigit())
+                    if cnpj_lpco and cnpj_lpco not in cnpjs_clientes:
+                        filtrados += 1
+                        time.sleep(_DELAY_ENTRE_CHAMADAS)
+                        continue
+
+                resultado[numero] = raw
+
                 if i % 50 == 0:
-                    logger.info("  %s: %d/%d detalhes obtidos.", label, i, len(pendentes))
+                    logger.info("  %s: %d/%d verificados, %d mantidos.", label, i, len(pendentes), len(resultado))
+
                 time.sleep(_DELAY_ENTRE_CHAMADAS)
+
+            logger.info(
+                "%s: %d LPCOs no relatório (%d descartados por CNPJ não-cliente).",
+                label, len(resultado), filtrados,
+            )
     except Exception as exc:
         logger.error("Erro na sessão %s: %s", label, exc)
     return resultado
 
 
-def _buscar_todos_detalhes() -> dict[str, dict]:
+def _buscar_detalhes_filtrados(data_inicio: str, data_fim: str) -> dict[str, dict]:
+    """
+    Descobre LPCOs do período via SE + NE, aplica filtro de CNPJ se configurado.
+    Se nenhum CNPJ estiver cadastrado, retorna TODOS os LPCOs do período (sem filtro).
+    """
+    cnpjs = listar_cnpjs_clientes()
+    if cnpjs:
+        logger.info("Filtro ativo: %d CNPJs de clientes cadastrados.", len(cnpjs))
+    else:
+        logger.warning(
+            "Nenhum CNPJ de cliente cadastrado — relatório incluirá TODOS os LPCOs do período. "
+            "Cadastre CNPJs via POST /cliente/registrar para filtrar."
+        )
+
     detalhes = _detalhar_em_sessao(
-        numeros=[],
+        ja_detalhados=[],
         pfx_path=config.CERT_PFX_PATH, pfx_base64=config.CERT_PFX_BASE64,
         pfx_password=config.CERT_PFX_PASSWORD, label="SE",
+        data_inicio=data_inicio, data_fim=data_fim,
+        cnpjs_clientes=cnpjs if cnpjs else None,
     )
     if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
         ne = _detalhar_em_sessao(
-            numeros=list(detalhes.keys()),
+            ja_detalhados=list(detalhes.keys()),
             pfx_path=config.CERT_NE_PFX_PATH, pfx_base64=config.CERT_NE_PFX_BASE64,
             pfx_password=config.CERT_NE_PFX_PASSWORD, label="NE",
+            data_inicio=data_inicio, data_fim=data_fim,
+            cnpjs_clientes=cnpjs if cnpjs else None,
         )
         detalhes.update(ne)
     return detalhes
@@ -862,10 +918,13 @@ def gerar_e_enviar_relatorio_semanal() -> None:
 
     logger.info("=== Relatório semanal iniciando — período: %s ===", periodo)
 
-    # 1. LPCOs via API
-    detalhes   = _buscar_todos_detalhes()
+    # 1. LPCOs via API — filtrado por data (7 dias) + CNPJs de clientes
+    detalhes   = _buscar_detalhes_filtrados(
+        data_inicio=inicio.strftime("%Y-%m-%d"),
+        data_fim=agora.strftime("%Y-%m-%d"),
+    )
     dados_lpco = [_extrair_campos(num, raw) for num, raw in detalhes.items()] if detalhes else []
-    logger.info("LPCOs: %d total, %d com detalhe.", len(detalhes), sum(1 for v in detalhes.values() if v))
+    logger.info("LPCOs no relatório: %d (clientes cadastrados: %d).", len(dados_lpco), total_clientes_cnpj())
 
     # 2. DUEs acumuladas no banco (período da semana)
     dues = listar_dues(
