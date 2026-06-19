@@ -12,6 +12,32 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path("lpco_monitor.db")
 
+# CNPJs dos clientes da Hevile — populados automaticamente no init_db().
+# Atualizar aqui quando houver novos clientes.
+_CLIENTES_SE = [
+    "48812543000130", "00605555000167", "53102491000148", "64654650000133",
+    "26244457000135", "11591434000120", "55573936000101", "42135730000140",
+    "48115574000131", "56026840000188", "08215522000112", "08215522000546",
+    "08215522000627", "08215522000708", "08215522000970", "31276127000161",
+    "15452593001176", "15531898000100", "41391017000102", "41391017000285",
+    "41999541000152", "56420707000101",
+]
+
+_CLIENTES_NE = [
+    "12786836000304", "38056418000436", "70092545408",    "43871437000103",
+    "02035825000177", "10879115000151", "40338215000131", "40338215000301",
+    "02968267000100", "68901040000148", "26332897000144", "33323324000110",
+    "04749699403",    "96736350001242", "96736350000190", "20928862000196",
+    "44273202000182", "07276194000282", "03068272000200", "19485654000180",
+    "09215311000142", "03271313148",    "53111600000193", "11591434000120",
+    "11591434000200", "04264905000120", "55573936000101", "27297671000112",
+    "22915143000166", "18450755000153", "02851995000120", "08215522000546",
+    "08215522000627", "08215522000708", "08215522000970", "08215522000112",
+    "14419108000128", "11034952000142", "11034952000304", "18783557000101",
+    "18693502000100", "12492143000147", "15452593001176", "08432692000159",
+    "17247892000122", "28463606000182", "03338912000166", "23777347000140",
+]
+
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -77,7 +103,27 @@ def init_db() -> None:
             )
         """)
         conn.commit()
+
+    # Auto-seed: garante que os CNPJs de clientes estão sempre populados,
+    # mesmo após um deploy que recria o container (e apaga o banco).
+    _seed_clientes_se_vazio()
+
     logger.info("Banco de dados inicializado em %s", DB_PATH)
+
+
+def _seed_clientes_se_vazio() -> None:
+    """Popula clientes_cnpj se a tabela estiver vazia (deploy limpo)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM clientes_cnpj WHERE ativo=1").fetchone()[0]
+        if total > 0:
+            return
+        todos = set(_CLIENTES_SE + _CLIENTES_NE)
+        conn.executemany(
+            "INSERT OR IGNORE INTO clientes_cnpj (cnpj, ativo) VALUES (?, 1)",
+            [(c,) for c in todos],
+        )
+        conn.commit()
+        logger.info("Auto-seed: %d CNPJs de clientes inseridos na tabela clientes_cnpj.", len(todos))
 
 
 def registrar_lpco(numero: str) -> bool:
