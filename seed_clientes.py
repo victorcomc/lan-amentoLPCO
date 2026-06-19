@@ -1,5 +1,5 @@
 """
-Popula a tabela clientes_cnpj com os CNPJs dos clientes da Hevile.
+Popula a tabela clientes_cnpj com os CNPJs/CPFs dos clientes da Hevile.
 
 Rode UMA VEZ no servidor após o deploy:
     python seed_clientes.py
@@ -9,7 +9,8 @@ Pode ser executado novamente sem problemas (INSERT OR REPLACE).
 
 from database import registrar_cnpj_cliente, listar_cnpjs_clientes, init_db
 
-CLIENTES = [
+# Clientes Diogenes (certificado SE)
+CLIENTES_SE = [
     "48.812.543/0001-30",
     "00.605.555/0001-67",
     "53.102.491/0001-48",
@@ -34,15 +35,78 @@ CLIENTES = [
     "56.420.707/0001-01",
 ]
 
+# Clientes Felipe (certificado NE)
+CLIENTES_NE = [
+    "12.786.836/0003-04",
+    "38.056.418/0004-36",
+    "700.925.454-08",       # CPF
+    "43.871.437/0001-03",
+    "02.035.825/0001-77",
+    "10.879.115/0001-51",
+    "40.338.215/0001-31",
+    "40.338.215/0003-01",
+    "02.968.267/0001-00",
+    "68.901.040/0001-48",
+    "26.332.897/0001-44",
+    "33.323.324/0001-10",
+    "047.496.994-03",       # CPF
+    "96.736.350/0012-42",
+    "96.736.350/0001-90",
+    "20.928.862/0001-96",
+    "44.273.202/0001-82",
+    "07.276.194/0002-82",
+    "03.068.272/0002-00",
+    "19.485.654/0001-80",
+    "09.215.311/0001-42",
+    "032.713.131-48",       # CPF
+    "53.111.600/0001-93",
+    "11.591.434/0001-20",
+    "11.591.434/0002-00",
+    "04.264.905/0001-20",
+    "55.573.936/0001-01",
+    "27.297.671/0001-12",
+    "22.915.143/0001-66",
+    "18.450.755/0001-53",
+    "02.851.995/0001-20",
+    "08.215.522/0005-46",
+    "08.215.522/0006-27",
+    "08.215.522/0007-08",
+    "08.215.522/0009-70",
+    "08.215.522/0001-12",
+    "14.419.108/0001-28",
+    "11.034.952/0001-42",
+    "11.034.952/0003-04",
+    "18.783.557/0001-01",
+    "18.693.502/0001-00",
+    "12.492.143/0001-47",
+    "15.452.593/0011-76",
+    "08.432.692/0001-59",
+    "17.247.892/0001-22",
+    "28.463.606/0001-82",
+    "03.338.912/0001-66",
+    "23.777.347/0001-40",
+]
+
 if __name__ == "__main__":
     init_db()
-    inseridos = 0
-    for cnpj in CLIENTES:
+
+    print("=== Clientes SE (Diogenes) ===")
+    se_inseridos = 0
+    for cnpj in CLIENTES_SE:
         if registrar_cnpj_cliente(cnpj):
-            inseridos += 1
+            se_inseridos += 1
             print(f"  + {cnpj}")
         else:
             print(f"  = {cnpj} (já existia)")
 
+    print(f"\n=== Clientes NE (Felipe) ===")
+    ne_inseridos = 0
+    for cnpj in CLIENTES_NE:
+        if registrar_cnpj_cliente(cnpj):
+            ne_inseridos += 1
+            print(f"  + {cnpj}")
+        else:
+            print(f"  = {cnpj} (já existia/duplicado entre listas)")
+
     total = len(listar_cnpjs_clientes())
-    print(f"\nConcluído: {inseridos} inseridos. Total ativo no banco: {total}")
+    print(f"\nConcluído: {se_inseridos + ne_inseridos} inseridos. Total ativo no banco: {total}")
