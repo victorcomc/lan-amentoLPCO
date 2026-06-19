@@ -21,7 +21,10 @@ import threading
 from flask import Flask, Response, request, jsonify
 
 from config import config
-from database import lpco_conhecido, registrar_lpco, registrar_evento, listar_eventos
+from database import (
+    lpco_conhecido, registrar_lpco, registrar_evento, listar_eventos,
+    registrar_due, atualizar_due_detalhe,
+)
 from email_service import notificar_lpco_liberado, notificar_falha_webhook
 
 logger = logging.getLogger(__name__)
@@ -275,8 +278,8 @@ def _handle_due(payload: dict) -> None:
     Payload: {"tipo": "DESEMBARACADA", "descricao": "...", "data": "...",
               "due": {"numero": "26BR...", "ruc": "6BR..."}}
 
-    Após receber o número, tenta consultar o detalhe via API para descobrir
-    o endpoint correto e logar todos os campos disponíveis (FOB, frete, peso, etc.).
+    Salva imediatamente no banco para pesquisa de mercado, depois tenta
+    enriquecer consultando o detalhe via API em background.
     """
     due_obj   = payload.get("due") or {}
     numero    = due_obj.get("numero", "")
@@ -294,16 +297,31 @@ def _handle_due(payload: dict) -> None:
         logger.warning("Evento duex-historico sem número de DUE — ignorando.")
         return
 
-    # Consulta detalhe em thread separada para não atrasar o ACK
+    # Persiste o evento imediatamente (campos básicos do webhook)
+    due_id = 0
+    try:
+        due_id = registrar_due({
+            "data_evento":     data_ev,
+            "numero_due":      numero,
+            "ruc":             ruc,
+            "tipo_evento":     tipo,
+            "descricao_evento": descricao,
+            "payload_json":    json.dumps(payload, ensure_ascii=False),
+        })
+        logger.info("DUE %s salva no banco (id=%d). Buscando detalhe...", numero, due_id)
+    except Exception as exc:
+        logger.error("DUE %s: erro ao salvar no banco: %s", numero, exc)
+
+    # Enriquece com detalhe da API em thread separada
     threading.Thread(
-        target=_consultar_e_logar_due,
-        args=(numero,),
+        target=_consultar_e_enriquecer_due,
+        args=(numero, due_id),
         daemon=True,
     ).start()
 
 
-def _consultar_e_logar_due(numero: str) -> None:
-    """Abre sessão e tenta obter o detalhe completo da DUE."""
+def _consultar_e_enriquecer_due(numero: str, due_id: int) -> None:
+    """Consulta o detalhe da DUE via API e enriquece o registro no banco."""
     from siscomex_client import SiscomexClient
     try:
         with SiscomexClient() as client:
@@ -311,19 +329,117 @@ def _consultar_e_logar_due(numero: str) -> None:
                 logger.error("DUE %s: autenticação falhou para consulta de detalhe.", numero)
                 return
             detalhe = client.consultar_due(numero)
-            if detalhe:
-                logger.info(
-                    "=== DUE DETALHE === numero=%s dados=%s",
-                    numero, json.dumps(detalhe, ensure_ascii=False),
-                )
-            else:
-                logger.warning(
-                    "DUE %s: detalhe não disponível ainda. "
-                    "Endpoint será descoberto conforme eventos chegarem.",
-                    numero,
-                )
+            if not detalhe:
+                logger.warning("DUE %s: detalhe não disponível via API.", numero)
+                return
+
+            logger.info(
+                "=== DUE DETALHE === numero=%s dados=%s",
+                numero, json.dumps(detalhe, ensure_ascii=False),
+            )
+
+            # Extrai campos do detalhe para enriquecer o banco
+            campos = _extrair_campos_due(detalhe)
+            campos["detalhe_json"] = json.dumps(detalhe, ensure_ascii=False)
+
+            if due_id:
+                try:
+                    atualizar_due_detalhe(due_id, campos)
+                    logger.info(
+                        "DUE %s enriquecida no banco: exportador=%s pais=%s peso=%.1fkg",
+                        numero,
+                        campos.get("exportador_nome", "?"),
+                        campos.get("pais_destino", "?"),
+                        campos.get("peso_liquido_kg") or 0,
+                    )
+                except Exception as exc:
+                    logger.error("DUE %s: erro ao atualizar detalhe no banco: %s", numero, exc)
+
     except Exception as exc:
         logger.error("DUE %s: erro ao consultar detalhe: %s", numero, exc)
+
+
+def _extrair_campos_due(detalhe: dict) -> dict:
+    """
+    Tenta extrair campos relevantes de um detalhe de DUE.
+    Os nomes reais dos campos serão confirmados quando o primeiro 200 chegar.
+    """
+    campos: dict = {}
+
+    # Exportador — variações comuns de nome de campo
+    for path in [
+        ("exportador", "cnpj"),
+        ("declarante", "cnpj"),
+        ("cnpjExportador",),
+        ("cnpj",),
+    ]:
+        val = detalhe
+        for k in path:
+            val = val.get(k, {}) if isinstance(val, dict) else {}
+        if val and isinstance(val, str):
+            campos["exportador_cnpj"] = val
+            break
+
+    for path in [
+        ("exportador", "nome"),
+        ("declarante", "nome"),
+        ("nomeExportador",),
+        ("razaoSocial",),
+    ]:
+        val = detalhe
+        for k in path:
+            val = val.get(k, {}) if isinstance(val, dict) else {}
+        if val and isinstance(val, str):
+            campos["exportador_nome"] = val
+            break
+
+    # Produto — pega primeiro item se houver lista
+    itens = detalhe.get("itens") or detalhe.get("mercadorias") or []
+    if isinstance(itens, list) and itens:
+        primeiro = itens[0] if isinstance(itens[0], dict) else {}
+        campos["produto_ncm"]  = str(primeiro.get("ncm") or primeiro.get("codigoNcm", ""))
+        campos["produto_desc"] = str(primeiro.get("descricao") or primeiro.get("denominacaoMercadoria", ""))
+
+    # Pesos
+    for k in ("pesoLiquido", "peso_liquido", "pesoLiquidoTotal"):
+        if detalhe.get(k) is not None:
+            try:
+                campos["peso_liquido_kg"] = float(detalhe[k])
+            except (TypeError, ValueError):
+                pass
+            break
+    for k in ("pesoBruto", "peso_bruto", "pesoBrutoTotal"):
+        if detalhe.get(k) is not None:
+            try:
+                campos["peso_bruto_kg"] = float(detalhe[k])
+            except (TypeError, ValueError):
+                pass
+            break
+
+    # Valor FOB
+    for k in ("valorFob", "valor_fob", "valorTotalFob", "vmle"):
+        if detalhe.get(k) is not None:
+            try:
+                campos["valor_fob_usd"] = float(detalhe[k])
+            except (TypeError, ValueError):
+                pass
+            break
+
+    # Destino / embarque
+    for k in ("paisDestino", "pais_destino", "codigoPaisDestino"):
+        if detalhe.get(k):
+            campos["pais_destino"] = str(detalhe[k])
+            break
+    for k in ("portoEmbarque", "porto_embarque", "localEmbarque", "codigoPortoEmbarque"):
+        if detalhe.get(k):
+            campos["porto_embarque"] = str(detalhe[k])
+            break
+    for k in ("embarcacao", "nomeEmbarcacao", "navio"):
+        if detalhe.get(k):
+            campos["embarcacao"] = str(detalhe[k])
+            break
+
+    return campos
 
 
 def _handle_exigencia(numero: str, payload: dict) -> None:

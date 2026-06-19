@@ -369,11 +369,18 @@ class SiscomexClient:
         O endpoint correto será descoberto na primeira chamada real e logado.
         """
         candidatos = [
+            # Módulo DUEX (módulo interno do evento duex-historico)
+            f"/duex/api/ext/due/{numero}",
+            f"/duex/api/ext/due/{numero}/detalhes",
+            f"/duex/api/ext/due?numeroDUE={numero}",
+            f"/duex/api/ext/due?numero={numero}",
+            # Módulo exportacao
             f"/exportacao/api/ext/due/{numero}",
             f"/exportacao/api/ext/due/{numero}/detalhes",
-            f"/due/api/ext/due/{numero}",
             f"/exportacao/api/ext/due?numeroDUE={numero}",
             f"/exportacao/api/ext/due?numero={numero}",
+            # Módulo due genérico
+            f"/due/api/ext/due/{numero}",
             f"/due/api/ext/due?numeroDUE={numero}",
         ]
         for path in candidatos:

@@ -34,6 +34,14 @@ ENDPOINTS_POST = [
 
 # GET — caminhos adicionais a tentar
 ENDPOINTS_GET_DUE = [
+    # Módulo DUEX (mesmo prefixo do evento "duex-historico")
+    f"/duex/api/ext/due/{DUE_NUMERO}",
+    f"/duex/api/ext/due/{DUE_NUMERO}/detalhes",
+    f"/duex/api/ext/due?numeroDUE={DUE_NUMERO}",
+    f"/duex/api/ext/due?numero={DUE_NUMERO}",
+    f"/duex/api/ext/due/{DUE_NUMERO}/itens",
+    f"/duex/api/ext/due/{DUE_NUMERO}/frete",
+    # Módulo due genérico
     f"/due/api/ext/due/{DUE_NUMERO}",
     f"/due/api/ext/due?numero={DUE_NUMERO}",
     f"/due/api/ext/due?numeroDUE={DUE_NUMERO}",
@@ -42,6 +50,7 @@ ENDPOINTS_GET_DUE = [
     f"/due/api/ext/due/{DUE_NUMERO}/exportador",
     f"/due/api/ext/due/{DUE_NUMERO}/frete",
     f"/due/api/ext/due/{DUE_NUMERO}/vmle",          # Valor da Mercadoria no Local de Embarque
+    # Módulo exportacao
     f"/exportacao/api/ext/due/{DUE_NUMERO}",
     f"/exportacao/api/ext/due/consulta",
     f"/exp/api/ext/due/{DUE_NUMERO}",
