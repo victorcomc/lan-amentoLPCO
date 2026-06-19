@@ -21,6 +21,7 @@ from io import BytesIO
 from typing import Any
 
 from config import config
+from database import listar_dues
 from siscomex_client import SiscomexClient
 
 logger = logging.getLogger(__name__)
@@ -400,6 +401,114 @@ def _gerar_excel(dados: list[dict], periodo_label: str) -> bytes:
     return buf.getvalue()
 
 
+def _adicionar_aba_dues(wb: Any, dues: list[dict]) -> None:
+    """
+    Adiciona duas abas ao workbook com dados de DUEs para pesquisa de mercado.
+    Só é chamada se houver DUEs no período.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        return
+
+    # -----------------------------------------------------------------------
+    # Aba: Resumo Mercado (DUEs agrupadas por exportador)
+    # -----------------------------------------------------------------------
+    ws_res = wb.create_sheet("Resumo Mercado (DUEs)")
+    _aplicar_cabecalho(ws_res, [
+        "CNPJ Exportador", "Nome Exportador", "Total DUEs",
+        "Peso Líquido Total (kg)", "Valor FOB Total (USD)",
+        "Produtos (NCM)", "Países Destino",
+        "Portos Embarque", "Embarcações", "Tipos de Evento",
+    ], cor_hex="1F4E79")
+
+    mercado: dict[str, dict] = defaultdict(lambda: {
+        "nome": "",
+        "dues": set(),
+        "peso_kg": 0.0,
+        "fob_usd": 0.0,
+        "ncms": set(),
+        "paises": set(),
+        "portos": set(),
+        "embarcacoes": set(),
+        "tipos": set(),
+    })
+
+    for d in dues:
+        chave = d.get("exportador_cnpj") or d.get("numero_due", "N/I")[:8]
+        m = mercado[chave]
+        if d.get("exportador_nome"):
+            m["nome"] = d["exportador_nome"]
+        m["dues"].add(d["numero_due"])
+        if d.get("peso_liquido_kg"):
+            m["peso_kg"] += float(d["peso_liquido_kg"])
+        if d.get("valor_fob_usd"):
+            m["fob_usd"] += float(d["valor_fob_usd"])
+        for campo, dest in [
+            ("produto_ncm",    "ncms"),
+            ("pais_destino",   "paises"),
+            ("porto_embarque", "portos"),
+            ("embarcacao",     "embarcacoes"),
+            ("tipo_evento",    "tipos"),
+        ]:
+            if d.get(campo):
+                m[dest].add(d[campo])
+
+    for cnpj, m in sorted(mercado.items(), key=lambda x: -len(x[1]["dues"])):
+        ws_res.append([
+            cnpj,
+            m["nome"] or "(sem detalhe ainda)",
+            len(m["dues"]),
+            round(m["peso_kg"], 1) if m["peso_kg"] else "",
+            round(m["fob_usd"], 2) if m["fob_usd"] else "",
+            " | ".join(sorted(m["ncms"])),
+            " | ".join(sorted(m["paises"])),
+            " | ".join(sorted(m["portos"])),
+            " | ".join(sorted(m["embarcacoes"])),
+            " | ".join(sorted(m["tipos"])),
+        ])
+
+    _ajustar_colunas(ws_res)
+    ws_res.freeze_panes = "A2"
+    ws_res.auto_filter.ref = ws_res.dimensions
+
+    # -----------------------------------------------------------------------
+    # Aba: Detalhe DUEs (uma linha por evento)
+    # -----------------------------------------------------------------------
+    ws_det = wb.create_sheet("Detalhe DUEs")
+    _aplicar_cabecalho(ws_det, [
+        "Número DUE", "Data Evento", "Tipo Evento", "Descrição",
+        "Exportador CNPJ", "Exportador Nome",
+        "NCM", "Produto / Espécie",
+        "Peso Líquido (kg)", "Peso Bruto (kg)", "Valor FOB (USD)",
+        "País Destino", "Porto Embarque", "Embarcação", "RUC",
+    ], cor_hex="375623")
+
+    for d in sorted(dues, key=lambda x: x.get("data_evento", "")):
+        ws_det.append([
+            d.get("numero_due", ""),
+            d.get("data_evento", ""),
+            d.get("tipo_evento", ""),
+            d.get("descricao_evento", ""),
+            d.get("exportador_cnpj", ""),
+            d.get("exportador_nome", ""),
+            d.get("produto_ncm", ""),
+            d.get("produto_desc", ""),
+            d.get("peso_liquido_kg") or "",
+            d.get("peso_bruto_kg") or "",
+            d.get("valor_fob_usd") or "",
+            d.get("pais_destino", ""),
+            d.get("porto_embarque", ""),
+            d.get("embarcacao", ""),
+            d.get("ruc", ""),
+        ])
+
+    _ajustar_colunas(ws_det)
+    ws_det.freeze_panes = "A2"
+    ws_det.auto_filter.ref = ws_det.dimensions
+
+
 # ---------------------------------------------------------------------------
 # Ponto de entrada do job semanal
 # ---------------------------------------------------------------------------
@@ -420,23 +529,38 @@ def gerar_e_enviar_relatorio_semanal() -> None:
 
     # 1. Descobre e detalha TODOS os LPCOs via API (SE + NE)
     detalhes = _buscar_todos_detalhes()
-
-    if not detalhes:
-        logger.error("Nenhum LPCO retornado pela API — relatório cancelado.")
-        return
-
-    com_dados = sum(1 for v in detalhes.values() if v)
+    dados_lpco = [_extrair_campos(num, raw) for num, raw in detalhes.items()] if detalhes else []
     logger.info(
-        "Total de LPCOs encontrados: %d (%d com detalhe completo).",
-        len(detalhes), com_dados,
+        "LPCOs encontrados: %d (%d com detalhe completo).",
+        len(detalhes), sum(1 for v in detalhes.values() if v),
     )
 
-    # 2. Extrai campos para o Excel
-    dados = [_extrair_campos(num, raw) for num, raw in detalhes.items()]
+    # 2. Busca DUEs de mercado acumuladas no banco (semana atual)
+    dues_periodo = listar_dues(
+        data_inicio=inicio.strftime("%Y-%m-%d"),
+        data_fim=agora.strftime("%Y-%m-%d"),
+    )
+    logger.info("DUEs de mercado no período: %d", len(dues_periodo))
+
+    if not dados_lpco and not dues_periodo:
+        logger.error("Sem LPCOs e sem DUEs no período — relatório cancelado.")
+        return
 
     # 3. Gera Excel
     try:
-        excel_bytes = _gerar_excel(dados, periodo)
+        import openpyxl
+        excel_bytes = _gerar_excel(dados_lpco, periodo) if dados_lpco else _gerar_excel([], periodo)
+
+        # Adiciona abas de DUE se houver dados (mesmo que LPCO esteja vazio)
+        if dues_periodo:
+            from io import BytesIO
+            wb = openpyxl.load_workbook(BytesIO(excel_bytes))
+            _adicionar_aba_dues(wb, dues_periodo)
+            buf = BytesIO()
+            wb.save(buf)
+            excel_bytes = buf.getvalue()
+            logger.info("Abas de pesquisa de mercado (DUEs) adicionadas ao Excel.")
+
     except Exception as exc:
         logger.error("Erro ao gerar Excel do relatório semanal: %s", exc)
         return
