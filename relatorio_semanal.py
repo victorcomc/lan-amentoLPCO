@@ -15,6 +15,7 @@ Agendamento padrão: toda sexta-feira às 14:00 (configurável em main.py).
 import logging
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Any
@@ -25,8 +26,9 @@ from siscomex_client import SiscomexClient
 
 logger = logging.getLogger(__name__)
 
-_DELAY_ENTRE_CHAMADAS = 0.4
-_TAMANHO_PAGINA = 50
+_DELAY_ENTRE_CHAMADAS = 0.2   # entre páginas da consulta
+_TAMANHO_PAGINA = 100         # itens por página (reduz número de round-trips)
+_WORKERS_DETALHE = 5          # chamadas paralelas ao detalhar_lpco
 
 _CORES_SITUACAO = {
     "DEFERIDO":         "C6EFCE",
@@ -50,7 +52,10 @@ _MODELOS = {
 
 
 def _detalhar_lista(numeros: list[str], label: str, pfx_path: str, pfx_base64: str, pfx_password: str) -> dict[str, dict]:
-    """Chama detalhar_lpco para uma lista específica de números. Retorna {numero: raw}."""
+    """
+    Chama detalhar_lpco em paralelo (_WORKERS_DETALHE workers) para uma lista de números.
+    A requests.Session é thread-safe para GETs concorrentes na mesma sessão.
+    """
     resultado: dict[str, dict] = {}
     if not numeros or not (pfx_path or pfx_base64):
         return resultado
@@ -63,16 +68,26 @@ def _detalhar_lista(numeros: list[str], label: str, pfx_path: str, pfx_base64: s
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
                 logger.error("Autenticação %s falhou.", label)
                 return resultado
-            for i, numero in enumerate(numeros, start=1):
+
+            def _um(numero: str) -> tuple[str, dict]:
                 try:
                     raw = client.detalhar_lpco(numero)
-                    resultado[numero] = raw if isinstance(raw, dict) else {}
+                    return numero, raw if isinstance(raw, dict) else {}
                 except Exception as exc:
                     logger.debug("%s: detalhe %s — %s", label, numero, exc)
-                    resultado[numero] = {}
-                if i % 50 == 0:
-                    logger.info("  %s: %d/%d detalhes obtidos.", label, i, len(numeros))
-                time.sleep(_DELAY_ENTRE_CHAMADAS)
+                    return numero, {}
+
+            concluidos = 0
+            with ThreadPoolExecutor(max_workers=_WORKERS_DETALHE) as pool:
+                futures = {pool.submit(_um, n): n for n in numeros}
+                for fut in as_completed(futures):
+                    numero, raw = fut.result()
+                    resultado[numero] = raw
+                    concluidos += 1
+                    if concluidos % 50 == 0:
+                        logger.info("  %s: %d/%d detalhes obtidos.", label, concluidos, len(numeros))
+
+            logger.info("  %s: %d detalhes concluídos.", label, len(resultado))
     except Exception as exc:
         logger.error("Erro na sessão %s: %s", label, exc)
     return resultado
