@@ -78,6 +78,58 @@ def notificar_falha_webhook(erro: str) -> None:
     )
 
 
+def enviar_relatorio_excel(
+    excel_bytes: bytes,
+    nome_arquivo: str,
+    periodo: str,
+    destinatarios: list[str] | None = None,
+) -> None:
+    """
+    Envia o relatório semanal de LPCOs como anexo Excel.
+    Se destinatarios não for informado, usa EMAIL_OPERACAO.
+    """
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    to = destinatarios or [config.EMAIL_OPERACAO]
+
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"[Relatório LPCO] Hevile — {periodo}"
+    msg["From"]    = config.SMTP_USER
+    msg["To"]      = ", ".join(to)
+
+    corpo_html = f"""
+    <html><body>
+    <h2>Relatório Semanal de LPCOs — Hevile Logística</h2>
+    <p>Segue em anexo o relatório do período <strong>{periodo}</strong>.</p>
+    <p>O arquivo Excel contém:</p>
+    <ul>
+      <li><strong>Resumo por Cliente</strong> — totais agrupados por CNPJ/empresa</li>
+      <li><strong>Detalhe LPCO</strong> — todos os processos individualmente</li>
+      <li><strong>Legenda</strong> — cores das situações</li>
+    </ul>
+    <p style="color:#888;font-size:12px">
+        Sistema de monitoramento automático — Portal Único Siscomex
+    </p>
+    </body></html>
+    """
+    msg.attach(MIMEText(corpo_html, "html", "utf-8"))
+
+    parte = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    parte.set_payload(excel_bytes)
+    encoders.encode_base64(parte)
+    parte.add_header("Content-Disposition", f'attachment; filename="{nome_arquivo}"')
+    msg.attach(parte)
+
+    with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=60) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.login(config.SMTP_USER, config.SMTP_APP_PASSWORD)
+        smtp.sendmail(config.SMTP_USER, to, msg.as_string())
+
+    logger.info("Relatório Excel enviado para %s | arquivo: %s", to, nome_arquivo)
+
+
 def _fmt_dict(d: dict, indent: int = 0) -> str:
     lines = []
     for k, v in d.items():

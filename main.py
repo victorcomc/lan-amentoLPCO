@@ -19,6 +19,7 @@ from sharepoint_sync import sincronizar_planilha
 from webhook_manager import WebhookManager
 from webhook_receiver import iniciar_servidor
 from email_service import notificar_falha_webhook
+from relatorio_semanal import gerar_e_enviar_relatorio_semanal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,9 +105,19 @@ def main() -> None:
         hours=1,
         id="sharepoint_sync",
     )
+    # Relatório semanal: toda sexta-feira às 14:00 (horário de Brasília)
+    scheduler.add_job(
+        gerar_e_enviar_relatorio_semanal,
+        "cron",
+        day_of_week="fri",
+        hour=14,
+        minute=0,
+        id="relatorio_semanal",
+        misfire_grace_time=3600,  # se o servidor estava down, roda em até 1h de atraso
+    )
     scheduler.start()
     logger.info(
-        "Jobs agendados: saúde a cada %dh, sync SharePoint a cada 1h.",
+        "Jobs agendados: saúde a cada %dh, sync SharePoint a cada 1h, relatório semanal toda sexta às 14:00.",
         config.WEBHOOK_HEALTH_CHECK_HOURS,
     )
 

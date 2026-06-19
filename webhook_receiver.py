@@ -12,14 +12,16 @@ IPs de origem do Siscomex que devem ser permitidos no firewall:
   161.148.0.0/16 | 189.9.0.0/16 | 200.198.192.0/18
 """
 
+import csv
 import hmac
+import io
 import json
 import logging
 import threading
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 
 from config import config
-from database import lpco_conhecido, registrar_lpco
+from database import lpco_conhecido, registrar_lpco, registrar_evento, listar_eventos
 from email_service import notificar_lpco_liberado, notificar_falha_webhook
 
 logger = logging.getLogger(__name__)
@@ -49,9 +51,15 @@ EVENTO_MSG      = "talp-msg-lpco-anu"
 EVENTO_RETIFAUT = "talp-retif-automat"
 EVENTO_PGTO     = "talp-falha-pagamento"
 
+_COLUNAS_CSV = [
+    "data_evento", "data_recebido", "numero_lpco", "codigo_modelo",
+    "tipo", "regiao", "destinatario_id", "situacao_id", "situacao_desc",
+    "justificativa", "cnpj_cpf",
+]
+
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @app.route("/webhook/lpco", methods=["POST"])
@@ -104,6 +112,41 @@ def registrar_lpco_endpoint():
     total = __import__("database").total_lpcos()
     logger.info("LPCO %s %s via Power Automate. Total no banco: %d.", numero, "registrado" if novo else "já existia", total)
     return jsonify({"ok": True, "numero": numero, "novo": novo}), 200
+
+
+@app.route("/relatorio/csv", methods=["GET"])
+def relatorio_csv():
+    """
+    Gera CSV com todos os eventos de alteração de situação registrados no banco.
+
+    Parâmetros opcionais:
+      ?de=YYYY-MM-DD   — data inicial (padrão: sem filtro)
+      ?ate=YYYY-MM-DD  — data final   (padrão: sem filtro)
+
+    Autenticação: header Secret (mesmo secret do webhook).
+    """
+    secret = request.headers.get("Secret", "")
+    if not _secret_valido(secret):
+        return jsonify({"error": "unauthorized"}), 401
+
+    de  = request.args.get("de", "")
+    ate = request.args.get("ate", "")
+
+    eventos = listar_eventos(de, ate)
+
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output, fieldnames=_COLUNAS_CSV, extrasaction="ignore", lineterminator="\r\n"
+    )
+    writer.writeheader()
+    writer.writerows(eventos)
+
+    sufixo = f"{de or 'inicio'}_{ate or 'hoje'}"
+    return Response(
+        "﻿" + output.getvalue(),           # BOM UTF-8 para Excel abrir corretamente
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="relatorio_lpco_{sufixo}.csv"'},
+    )
 
 
 @app.route("/health", methods=["GET"])
@@ -167,10 +210,7 @@ def _processar(event_type: str, raw_body: bytes, destinatario_id: str = "") -> N
 
 
 def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinatario_id: str = "") -> None:
-    """
-    talp-altsit-lpco-anu
-    Dispara email quando novaSituacao.id == "DEFERIDO" ou "INDEFERIDO".
-    """
+    """talp-altsit-lpco-anu — dispara email e persiste o evento no banco."""
     nova_situacao = payload.get("novaSituacao", {})
     situacao_id   = nova_situacao.get("id", "").upper()
     situacao_desc = nova_situacao.get("descricao", situacao_id)
@@ -178,12 +218,30 @@ def _handle_alteracao_situacao(numero: str, modelo: str, payload: dict, destinat
 
     logger.info("LPCO %s [%s] — nova situação: %s", numero, modelo, situacao_id)
 
-    cnpj_list = payload.get("cpfCnpj", [])
+    cnpj_list     = payload.get("cpfCnpj", [])
     destinatarios = _resolver_destinatarios(modelo, destinatario_id)
-    regiao = "NE" if (config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID) else "SE"
-    tipo_label = f"Pesca {regiao}"
+    regiao        = "NE" if (config.CERT_NE_OWNER_ID and destinatario_id == config.CERT_NE_OWNER_ID) else "SE"
+    tipo_label    = f"Pesca {regiao}"
 
     logger.info("LPCO %s [%s] → destinatários: %s", numero, tipo_label, destinatarios)
+
+    # Persiste no banco para histórico / relatórios
+    try:
+        registrar_evento({
+            "data_evento":     payload.get("dataEvento", ""),
+            "numero_lpco":     numero,
+            "codigo_modelo":   modelo,
+            "tipo":            tipo_label,
+            "regiao":          regiao,
+            "destinatario_id": destinatario_id,
+            "situacao_id":     situacao_id,
+            "situacao_desc":   situacao_desc,
+            "justificativa":   justificativa,
+            "cnpj_cpf":        ", ".join(cnpj_list),
+            "payload_json":    json.dumps(payload, ensure_ascii=False),
+        })
+    except Exception as exc:
+        logger.error("Falha ao persistir evento %s no banco: %s", numero, exc)
 
     detalhes_email = {
         "Número LPCO":    numero,
