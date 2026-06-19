@@ -83,10 +83,12 @@ def enviar_relatorio_excel(
     nome_arquivo: str,
     periodo: str,
     destinatarios: list[str] | None = None,
+    resumo_extra: str = "",
 ) -> None:
     """
     Envia o relatório semanal de LPCOs como anexo Excel.
     Se destinatarios não for informado, usa EMAIL_OPERACAO.
+    resumo_extra: texto adicional incluído no corpo do email (stats, observações).
     """
     from email.mime.base import MIMEBase
     from email import encoders
@@ -98,15 +100,26 @@ def enviar_relatorio_excel(
     msg["From"]    = config.SMTP_USER
     msg["To"]      = ", ".join(to)
 
+    resumo_html = ""
+    if resumo_extra:
+        linhas = resumo_extra.replace("\n", "<br>")
+        resumo_html = f"""
+    <div style="background:#f0f4ff;border-left:4px solid #1F4E79;padding:10px 16px;margin:12px 0;font-family:monospace;font-size:13px">
+      {linhas}
+    </div>"""
+
     corpo_html = f"""
     <html><body>
     <h2>Relatório Semanal de LPCOs — Hevile Logística</h2>
     <p>Segue em anexo o relatório do período <strong>{periodo}</strong>.</p>
+    {resumo_html}
     <p>O arquivo Excel contém:</p>
     <ul>
+      <li><strong>Visão Consolidada</strong> — LPCO e DUE cruzados por empresa/CNPJ</li>
       <li><strong>Resumo por Cliente</strong> — totais agrupados por CNPJ/empresa</li>
-      <li><strong>Detalhe LPCO</strong> — todos os processos individualmente</li>
-      <li><strong>Legenda</strong> — cores das situações</li>
+      <li><strong>Detalhe LPCO</strong> — todos os processos individualmente (coluna "Em SharePoint")</li>
+      <li><strong>Resumo Mercado / Detalhe DUEs</strong> — eventos DUE recebidos via webhook</li>
+      <li><strong>Análise de Mercado</strong> — rankings e totais gerais</li>
     </ul>
     <p style="color:#888;font-size:12px">
         Sistema de monitoramento automático — Portal Único Siscomex

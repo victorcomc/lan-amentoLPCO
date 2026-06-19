@@ -108,6 +108,13 @@ def total_lpcos() -> int:
         return conn.execute("SELECT COUNT(*) FROM lpcos_conhecidos").fetchone()[0]
 
 
+def listar_lpcos_conhecidos() -> list[str]:
+    """Retorna todos os números de LPCO registrados no banco."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT numero FROM lpcos_conhecidos").fetchall()
+    return [row[0] for row in rows]
+
+
 def registrar_evento(dados: dict[str, Any]) -> None:
     """Persiste um evento de webhook recebido para fins de histórico e relatório."""
     with sqlite3.connect(DB_PATH) as conn:

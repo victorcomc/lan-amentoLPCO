@@ -309,6 +309,7 @@ class SiscomexClient:
         situacao: str | None = None,
         data_inicio: str | None = None,
         data_fim: str | None = None,
+        cpf_cnpj: str | None = None,
         pagina: int = 1,
         tamanho: int = 10,
     ) -> PollingResult:
@@ -319,6 +320,7 @@ class SiscomexClient:
           situacao     — filtro de situação (ex: "DEFERIDO", "EM_ANALISE")
           data_inicio  — formato YYYY-MM-DD
           data_fim     — formato YYYY-MM-DD
+          cpf_cnpj     — CPF ou CNPJ do requerente (só dígitos)
           pagina       — página (default 1)
           tamanho      — itens por página (default 10; servidor TALPCO é lento com valores altos)
         """
@@ -330,6 +332,8 @@ class SiscomexClient:
             params["dataInicio"] = data_inicio
         if data_fim:
             params["dataFim"] = data_fim
+        if cpf_cnpj:
+            params["cpfCnpj"] = cpf_cnpj
 
         try:
             dados = self._get(self._LPCO_CONSULTA, params=params, timeout=self._TIMEOUT_DATA)

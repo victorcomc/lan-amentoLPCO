@@ -20,7 +20,7 @@ from io import BytesIO
 from typing import Any
 
 from config import config
-from database import listar_dues, listar_cnpjs_clientes, total_clientes_cnpj
+from database import listar_dues, listar_cnpjs_clientes, total_clientes_cnpj, listar_lpcos_conhecidos
 from siscomex_client import SiscomexClient
 
 logger = logging.getLogger(__name__)
@@ -48,51 +48,11 @@ _MODELOS = {
 # Descoberta e detalhe via API
 # ---------------------------------------------------------------------------
 
-def _paginar_lpcos(
-    client: SiscomexClient,
-    label: str,
-    data_inicio: str = "",
-    data_fim: str = "",
-) -> list[str]:
-    """Pagina /consulta com filtro de data para limitar ao período do relatório."""
-    numeros: list[str] = []
-    pagina = 1
-    while True:
-        resultado = client.buscar_lpcos(
-            pagina=pagina,
-            tamanho=_TAMANHO_PAGINA,
-            data_inicio=data_inicio or None,
-            data_fim=data_fim or None,
-        )
-        if not resultado.sucesso or not resultado.registros:
-            if pagina == 1 and not resultado.sucesso:
-                logger.warning("Falha na paginação %s: %s", label, resultado.erro)
-            break
-        for r in resultado.registros:
-            if r.numero:
-                numeros.append(r.numero)
-        logger.info("%s: página %d — %d LPCOs (acumulado: %d)", label, pagina, len(resultado.registros), len(numeros))
-        if len(resultado.registros) < _TAMANHO_PAGINA:
-            break
-        pagina += 1
-        time.sleep(_DELAY_ENTRE_CHAMADAS)
-    return numeros
 
-
-def _detalhar_em_sessao(
-    ja_detalhados: list[str],
-    pfx_path: str, pfx_base64: str, pfx_password: str,
-    label: str,
-    data_inicio: str = "",
-    data_fim: str = "",
-    cnpjs_clientes: set | None = None,
-) -> dict[str, dict]:
-    """
-    Pagina /consulta filtrando por data, detalha cada LPCO encontrado e,
-    se cnpjs_clientes estiver preenchido, descarta LPCOs de outros CNPJs.
-    """
+def _detalhar_lista(numeros: list[str], label: str, pfx_path: str, pfx_base64: str, pfx_password: str) -> dict[str, dict]:
+    """Chama detalhar_lpco para uma lista específica de números. Retorna {numero: raw}."""
     resultado: dict[str, dict] = {}
-    if not (pfx_path or pfx_base64):
+    if not numeros or not (pfx_path or pfx_base64):
         return resultado
     try:
         with SiscomexClient(
@@ -101,78 +61,203 @@ def _detalhar_em_sessao(
             cert_pfx_password=pfx_password,
         ) as client:
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
-                logger.error("Autenticação %s falhou para relatório.", label)
+                logger.error("Autenticação %s falhou.", label)
                 return resultado
-
-            encontrados = _paginar_lpcos(client, label, data_inicio, data_fim)
-            pendentes = [n for n in encontrados if n not in ja_detalhados]
-            logger.info("%s: %d encontrados no período, %d novos para detalhar.", label, len(encontrados), len(pendentes))
-
-            filtrados = 0
-            for i, numero in enumerate(pendentes, start=1):
+            for i, numero in enumerate(numeros, start=1):
                 try:
                     raw = client.detalhar_lpco(numero)
-                    raw = raw if isinstance(raw, dict) else {}
+                    resultado[numero] = raw if isinstance(raw, dict) else {}
                 except Exception as exc:
                     logger.debug("%s: detalhe %s — %s", label, numero, exc)
-                    raw = {}
-
-                # Filtro por CNPJ do cliente
-                if cnpjs_clientes:
-                    campos = _extrair_campos(numero, raw)
-                    cnpj_lpco = "".join(c for c in (campos.get("cnpj") or "") if c.isdigit())
-                    if cnpj_lpco and cnpj_lpco not in cnpjs_clientes:
-                        filtrados += 1
-                        time.sleep(_DELAY_ENTRE_CHAMADAS)
-                        continue
-
-                resultado[numero] = raw
-
+                    resultado[numero] = {}
                 if i % 50 == 0:
-                    logger.info("  %s: %d/%d verificados, %d mantidos.", label, i, len(pendentes), len(resultado))
-
+                    logger.info("  %s: %d/%d detalhes obtidos.", label, i, len(numeros))
                 time.sleep(_DELAY_ENTRE_CHAMADAS)
-
-            logger.info(
-                "%s: %d LPCOs no relatório (%d descartados por CNPJ não-cliente).",
-                label, len(resultado), filtrados,
-            )
     except Exception as exc:
         logger.error("Erro na sessão %s: %s", label, exc)
     return resultado
 
 
-def _buscar_detalhes_filtrados(data_inicio: str, data_fim: str) -> dict[str, dict]:
+def _cnpj_do_item_lista(raw_item: dict) -> str:
+    """Extrai CNPJ do item bruto da lista /consulta (sem precisar chamar /detalhe)."""
+    candidatos = [
+        "cpfCnpj", "cnpj", "cpf",
+        "cpfCnpjRequerente", "cnpjRequerente",
+        "cpfCnpjDeclarante", "cnpjDeclarante",
+        "cpfCnpjExportador", "cnpjExportador",
+    ]
+    for campo in candidatos:
+        val = raw_item.get(campo)
+        if val and isinstance(val, str):
+            return "".join(c for c in val if c.isdigit())
+
+    # Tenta dentro de objetos aninhados comuns no item de lista
+    for obj_campo in ("requerente", "exportador", "declarante", "importador", "solicitante"):
+        obj = raw_item.get(obj_campo)
+        if isinstance(obj, dict):
+            for campo in candidatos:
+                val = obj.get(campo)
+                if val and isinstance(val, str):
+                    return "".join(c for c in val if c.isdigit())
+    return ""
+
+
+def _paginar_filtrado_por_cnpj(
+    cnpjs_clientes: set[str],
+    label: str,
+    pfx_path: str, pfx_base64: str, pfx_password: str,
+) -> set[str]:
     """
-    Descobre LPCOs do período via SE + NE, aplica filtro de CNPJ se configurado.
-    Se nenhum CNPJ estiver cadastrado, retorna TODOS os LPCOs do período (sem filtro).
+    Pagina TODOS os LPCOs via /consulta e filtra pelos CNPJs de clientes
+    usando o item da lista (sem chamar detalhe para cada um).
+
+    Estratégia de filtro por ordem de confiança:
+    1. CNPJ encontrado no item da lista → filtra imediatamente (rápido)
+    2. CNPJ não encontrado no item → inclui na lista "incertos" para detalhar depois
     """
-    cnpjs = listar_cnpjs_clientes()
-    if cnpjs:
-        logger.info("Filtro ativo: %d CNPJs de clientes cadastrados.", len(cnpjs))
-    else:
-        logger.warning(
-            "Nenhum CNPJ de cliente cadastrado — relatório incluirá TODOS os LPCOs do período. "
-            "Cadastre CNPJs via POST /cliente/registrar para filtrar."
+    numeros_cliente: set[str] = set()
+    incertos: list[str] = []
+    total_api = 0
+
+    if not (pfx_path or pfx_base64):
+        return numeros_cliente
+    try:
+        with SiscomexClient(
+            cert_pfx_path=pfx_path,
+            cert_pfx_base64=pfx_base64,
+            cert_pfx_password=pfx_password,
+        ) as client:
+            if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
+                logger.error("Autenticação %s falhou.", label)
+                return numeros_cliente
+
+            pagina = 1
+            while True:
+                resultado = client.buscar_lpcos(pagina=pagina, tamanho=_TAMANHO_PAGINA)
+                if not resultado.sucesso or not resultado.registros:
+                    if pagina == 1 and not resultado.sucesso:
+                        logger.warning("%s: falha na paginação — %s", label, resultado.erro)
+                    break
+
+                for record in resultado.registros:
+                    if not record.numero:
+                        continue
+                    total_api += 1
+                    cnpj = _cnpj_do_item_lista(record.raw)
+                    if cnpj:
+                        if cnpj in cnpjs_clientes:
+                            numeros_cliente.add(record.numero)
+                        # else: não é cliente, descarta sem chamar detail
+                    else:
+                        # Sem CNPJ no item da lista — precisa detalhar para saber
+                        incertos.append(record.numero)
+
+                if pagina % 5 == 0:
+                    logger.info(
+                        "%s: pág. %d — %d total, %d clientes, %d incertos",
+                        label, pagina, total_api, len(numeros_cliente), len(incertos),
+                    )
+                if len(resultado.registros) < _TAMANHO_PAGINA:
+                    break
+                pagina += 1
+                time.sleep(_DELAY_ENTRE_CHAMADAS)
+
+        logger.info(
+            "%s: paginação concluída — %d total, %d clientes (lista), %d incertos",
+            label, total_api, len(numeros_cliente), len(incertos),
         )
 
-    detalhes = _detalhar_em_sessao(
-        ja_detalhados=[],
-        pfx_path=config.CERT_PFX_PATH, pfx_base64=config.CERT_PFX_BASE64,
-        pfx_password=config.CERT_PFX_PASSWORD, label="SE",
-        data_inicio=data_inicio, data_fim=data_fim,
-        cnpjs_clientes=cnpjs if cnpjs else None,
+        # Resolve incertos: detalha e checa CNPJ
+        if incertos:
+            logger.info("%s: resolvendo %d LPCOs sem CNPJ na lista via detalhe.", label, len(incertos))
+            detalhes_incertos = _detalhar_lista(
+                incertos, f"{label}-incertos", pfx_path, pfx_base64, pfx_password,
+            )
+            resolvidos = 0
+            for numero, raw in detalhes_incertos.items():
+                campos = _extrair_campos(numero, raw)
+                cnpj = "".join(c for c in (campos.get("cnpj") or "") if c.isdigit())
+                if cnpj in cnpjs_clientes:
+                    numeros_cliente.add(numero)
+                    resolvidos += 1
+            logger.info("%s: %d/%d incertos eram clientes.", label, resolvidos, len(incertos))
+
+    except Exception as exc:
+        logger.error("Erro na sessão %s: %s", label, exc)
+
+    return numeros_cliente
+
+
+def _buscar_lpcos_clientes() -> tuple[dict[str, dict], dict]:
+    """
+    Ponto de entrada para obter LPCOs dos clientes:
+    1. Pagina a API completa e filtra pelos 70 CNPJs cadastrados
+    2. Detalha apenas os LPCOs filtrados
+    3. Compara com lpcos_conhecidos para separar "nossos" vs "novos"
+
+    Retorna:
+        detalhes: {numero: raw_dict}
+        stats: {total, nossos, novos, cnpjs_buscados}
+    """
+    cnpjs = listar_cnpjs_clientes()
+    if not cnpjs:
+        logger.warning("Nenhum CNPJ de cliente cadastrado — LPCOs não serão incluídos.")
+        return {}, {"total": 0, "nossos": 0, "novos": 0, "cnpjs_buscados": 0}
+
+    conhecidos = set(listar_lpcos_conhecidos())
+    logger.info(
+        "Buscando LPCOs para %d CNPJs de clientes. %d LPCOs registrados como 'nossos' (SharePoint).",
+        len(cnpjs), len(conhecidos),
+    )
+
+    # 1. Pagina e filtra por CNPJ usando o item da lista
+    numeros_se = _paginar_filtrado_por_cnpj(
+        cnpjs, "SE",
+        config.CERT_PFX_PATH, config.CERT_PFX_BASE64, config.CERT_PFX_PASSWORD,
+    )
+    numeros_ne: set[str] = set()
+    if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
+        numeros_ne = _paginar_filtrado_por_cnpj(
+            cnpjs, "NE",
+            config.CERT_NE_PFX_PATH, config.CERT_NE_PFX_BASE64, config.CERT_NE_PFX_PASSWORD,
+        )
+
+    todos_numeros = list(numeros_se | numeros_ne)
+    logger.info("Total de LPCOs de clientes encontrados: %d (SE: %d, NE: %d)", len(todos_numeros), len(numeros_se), len(numeros_ne))
+
+    if not todos_numeros:
+        logger.warning("Nenhum LPCO de cliente encontrado na API.")
+        return {}, {"total": 0, "nossos": 0, "novos": 0, "cnpjs_buscados": len(cnpjs)}
+
+    # 2. Detalha os filtrados (SE tenta todos, NE complementa os que SE não retornou)
+    detalhes = _detalhar_lista(
+        todos_numeros, "SE-detalhe",
+        config.CERT_PFX_PATH, config.CERT_PFX_BASE64, config.CERT_PFX_PASSWORD,
     )
     if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
-        ne = _detalhar_em_sessao(
-            ja_detalhados=list(detalhes.keys()),
-            pfx_path=config.CERT_NE_PFX_PATH, pfx_base64=config.CERT_NE_PFX_BASE64,
-            pfx_password=config.CERT_NE_PFX_PASSWORD, label="NE",
-            data_inicio=data_inicio, data_fim=data_fim,
-            cnpjs_clientes=cnpjs if cnpjs else None,
-        )
-        detalhes.update(ne)
-    return detalhes
+        sem_dados = [n for n in todos_numeros if not detalhes.get(n)]
+        if sem_dados:
+            ne_detalhe = _detalhar_lista(
+                sem_dados, "NE-detalhe",
+                config.CERT_NE_PFX_PATH, config.CERT_NE_PFX_BASE64, config.CERT_NE_PFX_PASSWORD,
+            )
+            detalhes.update(ne_detalhe)
+
+    # 3. Stats: nossos (em lpcos_conhecidos) vs novos (não registrados ainda)
+    nossos = sum(1 for n in todos_numeros if n in conhecidos)
+    novos  = len(todos_numeros) - nossos
+
+    stats = {
+        "total": len(todos_numeros),
+        "nossos": nossos,
+        "novos": novos,
+        "cnpjs_buscados": len(cnpjs),
+    }
+    logger.info(
+        "Stats LPCO: %d total — %d nossos (SharePoint) / %d novos (não registrados).",
+        len(todos_numeros), nossos, novos,
+    )
+    return detalhes, stats
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +364,7 @@ def _extrair_campos(numero: str, raw: dict) -> dict:
         "situacao_desc":      sit_desc,
         "numero_processo":    _get_nested(raw, "numeroProcesso", "processo", "numProcesso"),
         "numero_di_due":      _get_nested(raw, "numeroDUE", "numeroDI", "numDUE", "numDI"),
+        "em_sharepoint":      False,  # preenchido depois pelo chamador com base em lpcos_conhecidos
     }
 
 
@@ -570,6 +656,7 @@ def _aba_detalhe_lpco(wb: Any, dados: list[dict]) -> None:
         "Data Emissão", "Data Validade",
         "Número Processo", "Número DUE/DI",
         "Situação",
+        "Em SharePoint",
     ])
 
     for d in sorted(dados, key=lambda x: (x.get("cnpj", ""), x.get("numero_lpco", ""))):
@@ -586,6 +673,7 @@ def _aba_detalhe_lpco(wb: Any, dados: list[dict]) -> None:
             d["data_emissao"], d["data_validade"],
             d["numero_processo"], d["numero_di_due"],
             sit_label,
+            "Sim" if d.get("em_sharepoint") else "Novo",
         ])
 
         cor = _CORES_SITUACAO.get(d["situacao_id"].upper() if d["situacao_id"] else "", "")
@@ -905,8 +993,10 @@ def _gerar_excel_completo(dados_lpco: list[dict], dues: list[dict], periodo_labe
 
 def gerar_e_enviar_relatorio_semanal() -> None:
     """
-    Varre TODOS os LPCOs acessíveis via SE e NE (sem filtro do banco),
-    combina com DUEs acumuladas no período e envia Excel por email.
+    1. Pagina TODOS os LPCOs visíveis via certificado e filtra pelos CNPJs dos clientes cadastrados.
+    2. Detalha apenas os LPCOs de clientes encontrados.
+    3. Marca quais já estão em lpcos_conhecidos ("nossos") e quais são novos.
+    4. Combina com DUEs acumuladas no banco e envia Excel por email.
     Chamado pelo APScheduler toda sexta-feira às 14:00.
     """
     from email_service import enviar_relatorio_excel
@@ -918,13 +1008,20 @@ def gerar_e_enviar_relatorio_semanal() -> None:
 
     logger.info("=== Relatório semanal iniciando — período: %s ===", periodo)
 
-    # 1. LPCOs via API — filtrado por data (7 dias) + CNPJs de clientes
-    detalhes   = _buscar_detalhes_filtrados(
-        data_inicio=inicio.strftime("%Y-%m-%d"),
-        data_fim=agora.strftime("%Y-%m-%d"),
+    # 1. LPCOs dos clientes — pagina API completa e filtra por CNPJ antes de chamar detalhe
+    detalhes, stats_lpco = _buscar_lpcos_clientes()
+
+    conhecidos = set(listar_lpcos_conhecidos())
+    dados_lpco: list[dict] = []
+    for num, raw in detalhes.items():
+        campos = _extrair_campos(num, raw)
+        campos["em_sharepoint"] = num in conhecidos
+        dados_lpco.append(campos)
+
+    logger.info(
+        "LPCOs de clientes: %d total — %d nossos (SharePoint) / %d novos.",
+        stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), stats_lpco.get("novos", 0),
     )
-    dados_lpco = [_extrair_campos(num, raw) for num, raw in detalhes.items()] if detalhes else []
-    logger.info("LPCOs no relatório: %d (clientes cadastrados: %d).", len(dados_lpco), total_clientes_cnpj())
 
     # 2. DUEs acumuladas no banco (período da semana)
     dues = listar_dues(
@@ -944,9 +1041,16 @@ def gerar_e_enviar_relatorio_semanal() -> None:
         logger.error("Erro ao gerar Excel: %s", exc)
         return
 
-    # 4. Envia por email
+    # 4. Envia por email com resumo no corpo
+    resumo = (
+        f"Período: {periodo}\n"
+        f"LPCOs de clientes: {stats_lpco.get('total', 0)} "
+        f"({stats_lpco.get('nossos', 0)} já no SharePoint / {stats_lpco.get('novos', 0)} novos)\n"
+        f"DUEs no período: {len(dues)}\n"
+        f"CNPJs de clientes buscados: {stats_lpco.get('cnpjs_buscados', 0)}"
+    )
     try:
-        enviar_relatorio_excel(excel_bytes, nome, periodo)
+        enviar_relatorio_excel(excel_bytes, nome, periodo, resumo_extra=resumo)
         logger.info("=== Relatório enviado: %s ===", nome)
     except Exception as exc:
         logger.error("Erro ao enviar relatório: %s", exc)
