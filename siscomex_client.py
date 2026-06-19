@@ -8,9 +8,12 @@ O .pfx é convertido em memória para PEM temporário — nenhum arquivo interme
 é gravado em disco, evitando exposição da chave privada.
 """
 
+import hashlib
 import logging
 import os
 import tempfile
+import threading
+import time as _time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,6 +26,14 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Cache de tokens JWT — compartilhado entre todas as instâncias no processo
+# O Portal limita 1 autenticação/60s por certificado; o token dura ~1h.
+# ---------------------------------------------------------------------------
+_TOKEN_CACHE: dict[str, dict] = {}  # cache_key → {jwt, csrf, cached_at}
+_TOKEN_LOCK = threading.Lock()
+_TOKEN_TTL = 55 * 60  # 55 min — reautentica antes de expirar
 
 
 # ---------------------------------------------------------------------------
@@ -212,21 +223,50 @@ class SiscomexClient:
     # Autenticação
     # ------------------------------------------------------------------
 
+    def _cache_key(self, role_type: str) -> str:
+        """Chave única por certificado + perfil de acesso."""
+        fingerprint = hashlib.sha1(self._cert_pem).hexdigest()[:16]
+        return f"{fingerprint}:{role_type}"
+
+    def _injetar_token_em_sessao(self, jwt_token: str, csrf_token: str) -> None:
+        assert self._session
+        self._session.headers["authorization"] = jwt_token
+        if csrf_token:
+            self._session.headers["x-csrf-token"] = csrf_token
+            self._session.hooks["response"].append(self._renovar_csrf)
+        try:
+            self._get("/portal/api/ext/webhook")
+        except Exception:
+            pass
+
     def autenticar(self, role_type: str) -> bool:
         """
         Autentica na plataforma Portal Único com o header Role-Type via POST.
 
-        O Portal retorna o JWT em 'set-token' e o CSRF em 'x-csrf-token'.
-        Ambos são injetados nos headers padrão da sessão:
-          authorization: <JWT>   (sem prefixo Bearer — padrão não-standard do portal)
-          x-csrf-token:  <CSRF>  (renovado automaticamente a cada resposta via hook)
+        O Portal limita 1 autenticação/60s por certificado. Para contornar:
+          1. Verifica cache interno (compartilhado entre instâncias no mesmo processo)
+          2. Se tiver token válido (< 55 min), injeta na sessão sem chamar o endpoint
+          3. Se receber 422 (já autenticou nos últimos 60s), reutiliza o cache
+          4. Em caso de sucesso, armazena o novo token no cache
 
         Role-Type válidos: IMPEXP, DEPOSIT, OPERPORT, TRANSPORT, etc.
-        (ver tabela de domínio no manual PLAT — Aspectos Gerais → Perfis de Acesso)
-
-        Retorna True se autenticado com sucesso.
         """
         assert self._session
+        key = self._cache_key(role_type)
+
+        # 1. Verifica cache
+        with _TOKEN_LOCK:
+            entrada = _TOKEN_CACHE.get(key)
+            if entrada:
+                age = _time.monotonic() - entrada["cached_at"]
+                if age < _TOKEN_TTL:
+                    logger.info(
+                        "Autenticação via cache (age=%.0fs, Role-Type=%s).", age, role_type
+                    )
+                    self._injetar_token_em_sessao(entrada["jwt"], entrada["csrf"])
+                    return True
+
+        # 2. Chama o endpoint de autenticação
         url = f"{self._base_url}{self._AUTH_PATH}"
         logger.debug("Autenticando com Role-Type=%s em POST %s", role_type, url)
         resp = self._session.post(
@@ -235,6 +275,23 @@ class SiscomexClient:
             allow_redirects=False,
             timeout=self._TIMEOUT,
         )
+
+        # 3. Portal retornou 422 = token válido existe, mas está em outro cache
+        if resp.status_code == 422:
+            with _TOKEN_LOCK:
+                entrada = _TOKEN_CACHE.get(key)
+            if entrada:
+                age = _time.monotonic() - entrada["cached_at"]
+                logger.warning(
+                    "Auth 422 (rate limit) — reutilizando token em cache (age=%.0fs).", age
+                )
+                self._injetar_token_em_sessao(entrada["jwt"], entrada["csrf"])
+                return True
+            logger.error(
+                "Auth 422 e nenhum token em cache disponível. "
+                "Aguarde 60s e tente novamente."
+            )
+            return False
 
         if resp.status_code != 200:
             body = resp.json() if resp.content else {}
@@ -245,7 +302,6 @@ class SiscomexClient:
             )
             return False
 
-        # Extrai tokens da resposta e os injeta na sessão
         jwt_token  = resp.headers.get("Set-Token", "")
         csrf_token = resp.headers.get("X-CSRF-Token", "")
 
@@ -257,22 +313,15 @@ class SiscomexClient:
             )
             return False
 
-        # Portal Único usa o JWT bruto no header 'authorization' (sem prefixo Bearer)
-        self._session.headers["authorization"] = jwt_token
+        # 4. Armazena no cache e injeta na sessão
+        with _TOKEN_LOCK:
+            _TOKEN_CACHE[key] = {
+                "jwt":       jwt_token,
+                "csrf":      csrf_token,
+                "cached_at": _time.monotonic(),
+            }
 
-        # X-CSRF-Token é renovado a cada resposta; atualiza via hook
-        if csrf_token:
-            self._session.headers["x-csrf-token"] = csrf_token
-            self._session.hooks["response"].append(self._renovar_csrf)
-
-        # O CSRF do auth precisa ser "ativado" por uma chamada ao namespace /portal
-        # antes de funcionar em /talpco — uma listagem de webhooks é suficiente
-        try:
-            self._get("/portal/api/ext/webhook")
-            logger.debug("CSRF ativado via chamada portal.")
-        except Exception:
-            pass  # falha não é crítica — o CSRF pode já estar ativo
-
+        self._injetar_token_em_sessao(jwt_token, csrf_token)
         logger.info("Autenticação bem-sucedida (Role-Type=%s).", role_type)
         return True
 

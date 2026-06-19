@@ -199,6 +199,9 @@ def listar_clientes_endpoint():
     return jsonify({"total": len(cnpjs), "cnpjs": cnpjs}), 200
 
 
+_relatorio_lock = threading.Lock()
+
+
 @app.route("/relatorio/enviar", methods=["GET", "POST"])
 def enviar_relatorio_agora():
     """
@@ -209,8 +212,18 @@ def enviar_relatorio_agora():
     if not _secret_valido(secret):
         return "<h2>❌ Secret inválido</h2>", 401
 
-    from relatorio_semanal import gerar_e_enviar_relatorio_semanal
-    threading.Thread(target=gerar_e_enviar_relatorio_semanal, daemon=True).start()
+    if not _relatorio_lock.acquire(blocking=False):
+        logger.warning("Relatório já está em execução — requisição ignorada.")
+        return "<h2>⏳ Relatório já está em geração — aguarde o email.</h2>", 200
+
+    def _run():
+        try:
+            from relatorio_semanal import gerar_e_enviar_relatorio_semanal
+            gerar_e_enviar_relatorio_semanal()
+        finally:
+            _relatorio_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
     logger.info("Relatório semanal disparado manualmente via /relatorio/enviar.")
     return "<h2>✅ Relatório em geração — chegará por email em alguns minutos.</h2>", 200
 
