@@ -463,8 +463,10 @@ def _extrair_campos_due(detalhe: dict) -> dict:
         return _extrair_campos_due_resumida(detalhe)
 
     itens = detalhe.get("itens") or []
+    primeiro = itens[0] if itens else {}
 
-    # Exportador — schema usa 'numero'; fallback para 'numeroDoDocumento' (versão anterior)
+    # Exportador CNPJ — itens[].exportador.numeroDoDocumento (API real não usa 'numero')
+    # Fallback: declarante.numeroDoDocumento no nível raiz
     exportador_cnpj = ""
     exportador_nome = ""
     for item in itens:
@@ -472,12 +474,18 @@ def _extrair_campos_due(detalhe: dict) -> dict:
         doc = exp.get("numero") or exp.get("numeroDoDocumento", "")
         if doc:
             exportador_cnpj = doc
-            exportador_nome = exp.get("nome", "")
             break
+    if not exportador_cnpj:
+        declarante = detalhe.get("declarante") or {}
+        exportador_cnpj = declarante.get("numero") or declarante.get("numeroDoDocumento", "")
+
+    # Exportador nome — a API NÃO inclui 'nome' em itens[].exportador
+    # Usa declarante.nome do nível raiz (declarante = quem registrou a DUE = exportador)
+    declarante = detalhe.get("declarante") or {}
+    exportador_nome = declarante.get("nome", "")
 
     # NCM e descrição — primeiro item
-    primeiro = itens[0] if itens else {}
-    ncm_obj  = primeiro.get("ncm") or {}
+    ncm_obj    = primeiro.get("ncm") or {}
     ncm_codigo = ncm_obj.get("codigo", "")
     ncm_desc   = ncm_obj.get("descricao", "") or primeiro.get("descricaoDaMercadoria", "")
 
@@ -495,17 +503,27 @@ def _extrair_campos_due(detalhe: dict) -> dict:
     except (TypeError, ValueError):
         fob = 0.0
 
-    # País destino — primeiro país do primeiro item, fallback no paisImportador
-    paises = primeiro.get("listaPaisDestino") or []
-    if paises and isinstance(paises[0], dict):
-        pais = paises[0].get("nome", "")
-    else:
+    # País destino — listaPaisDestino só retorna {"codigo": N}, sem nome
+    # Extrai de enderecoImportador: "...EXTERIOR - NOME DO PAÍS"
+    pais = ""
+    paises_lista = primeiro.get("listaPaisDestino") or []
+    if paises_lista and isinstance(paises_lista[0], dict):
+        pais = paises_lista[0].get("nome", "")
+    if not pais:
+        endereco = primeiro.get("enderecoImportador", "")
+        if "EXTERIOR - " in endereco:
+            pais = endereco.split("EXTERIOR - ")[-1].strip()
+    if not pais:
         pais_imp = detalhe.get("paisImportador") or {}
         pais = pais_imp.get("nome", "") if isinstance(pais_imp, dict) else ""
 
-    # Porto de embarque
+    # Porto de embarque — recintoAduaneiroDeEmbarque só retorna {"codigo": "..."}, sem descricao
+    # Usa o código como fallback
     recinto_emb = detalhe.get("recintoAduaneiroDeEmbarque") or {}
-    porto = recinto_emb.get("descricao", "") if isinstance(recinto_emb, dict) else ""
+    if isinstance(recinto_emb, dict):
+        porto = recinto_emb.get("descricao") or recinto_emb.get("codigo", "")
+    else:
+        porto = ""
 
     return {
         "exportador_cnpj": exportador_cnpj,
