@@ -99,11 +99,13 @@ def _buscar_lpcos_por_cnpj(
     cnpjs_clientes: set[str],
     label: str,
     pfx_path: str, pfx_base64: str, pfx_password: str,
+    data_inicio: str = "",
 ) -> set[str]:
     """
     Busca LPCOs de cada cliente usando o parâmetro 'importador-exportador' da API.
     Uma chamada por CNPJ — retorna só os LPCOs daquele cliente.
     Paginação via offset (a API TALPCO não aceita tamanhoPagina).
+    data_inicio: filtro de data de registro (YYYY-MM-DD), evita puxar histórico inteiro.
     """
     numeros: set[str] = set()
     if not cnpjs_clientes or not (pfx_path or pfx_base64):
@@ -127,6 +129,7 @@ def _buscar_lpcos_por_cnpj(
                         cpf_cnpj=cnpj,
                         tipo_operacao="EXPORTACAO",
                         offset=offset,
+                        data_inicio=data_inicio or None,
                     )
                     if not resultado.sucesso or not resultado.registros:
                         break
@@ -156,10 +159,10 @@ def _buscar_lpcos_por_cnpj(
     return numeros
 
 
-def _buscar_lpcos_clientes() -> tuple[dict[str, dict], dict]:
+def _buscar_lpcos_clientes(data_inicio: str = "") -> tuple[dict[str, dict], dict]:
     """
     Ponto de entrada para obter LPCOs dos clientes:
-    1. Pagina a API completa e filtra pelos 70 CNPJs cadastrados
+    1. Busca por CNPJ usando importador-exportador, com filtro de data
     2. Detalha apenas os LPCOs filtrados
     3. Compara com lpcos_conhecidos para separar "nossos" vs "novos"
 
@@ -182,12 +185,14 @@ def _buscar_lpcos_clientes() -> tuple[dict[str, dict], dict]:
     numeros_se = _buscar_lpcos_por_cnpj(
         cnpjs, "SE",
         config.CERT_PFX_PATH, config.CERT_PFX_BASE64, config.CERT_PFX_PASSWORD,
+        data_inicio=data_inicio,
     )
     numeros_ne: set[str] = set()
     if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
         numeros_ne = _buscar_lpcos_por_cnpj(
             cnpjs, "NE",
             config.CERT_NE_PFX_PATH, config.CERT_NE_PFX_BASE64, config.CERT_NE_PFX_PASSWORD,
+            data_inicio=data_inicio,
         )
 
     todos_numeros = list(numeros_se | numeros_ne)
@@ -1046,10 +1051,11 @@ def gerar_e_enviar_relatorio_semanal() -> None:
     """
     from email_service import enviar_relatorio_excel
 
-    agora   = datetime.now()
-    inicio  = agora - timedelta(days=7)
-    periodo = f"{inicio.strftime('%d/%m/%Y')} a {agora.strftime('%d/%m/%Y')}"
-    nome    = f"relatorio_mercado_{agora.strftime('%Y-%m-%d')}.xlsx"
+    agora       = datetime.now()
+    inicio      = agora - timedelta(days=7)
+    lpco_inicio = agora - timedelta(days=30)   # busca LPCOs dos últimos 30 dias
+    periodo     = f"{inicio.strftime('%d/%m/%Y')} a {agora.strftime('%d/%m/%Y')}"
+    nome        = f"relatorio_mercado_{agora.strftime('%Y-%m-%d')}.xlsx"
 
     from email_service import notificar_falha_webhook
     t0 = time.time()
@@ -1058,9 +1064,9 @@ def gerar_e_enviar_relatorio_semanal() -> None:
     def _elapsed() -> str:
         return f"{time.time() - t0:.0f}s"
 
-    # 1. LPCOs dos clientes — pagina API completa e filtra por CNPJ antes de chamar detalhe
-    logger.info("[%s] Etapa 1/4: buscando LPCOs dos clientes...", _elapsed())
-    detalhes, stats_lpco = _buscar_lpcos_clientes()
+    # 1. LPCOs dos clientes — filtro por CNPJ + últimos 90 dias
+    logger.info("[%s] Etapa 1/4: buscando LPCOs dos clientes (últimos 30 dias)...", _elapsed())
+    detalhes, stats_lpco = _buscar_lpcos_clientes(data_inicio=lpco_inicio.strftime("%Y-%m-%d"))
 
     conhecidos = set(listar_lpcos_conhecidos())
     dados_lpco: list[dict] = []
