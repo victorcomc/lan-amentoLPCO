@@ -394,6 +394,7 @@ class SiscomexClient:
             params["codigo-modelo"] = codigo_modelo
 
         try:
+            logger.info("buscar_lpcos params=%s", params)
             dados = self._get(self._LPCO_CONSULTA, params=params, timeout=self._TIMEOUT_DATA)
             items = (
                 dados if isinstance(dados, list)
@@ -401,8 +402,9 @@ class SiscomexClient:
             )
             registros = [self._parse_lpco_item(it) for it in items]
             logger.info(
-                "Polling %s — %d LPCO(s) retornado(s).",
-                timestamp.isoformat(timespec="seconds"),
+                "buscar_lpcos cnpj=%s offset=%s — %d LPCO(s) retornado(s).",
+                params.get("importador-exportador", "ALL"),
+                params.get("offset", 0),
                 len(registros),
             )
             return PollingResult(sucesso=True, timestamp=timestamp, registros=registros)
