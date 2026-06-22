@@ -201,6 +201,69 @@ def listar_clientes_endpoint():
 
 _relatorio_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Cache de tabelas TABX — carregado uma vez na primeira DUE recebida
+# ---------------------------------------------------------------------------
+_CACHE_PAISES: dict[str, str]   = {}   # str(codigo_int) → nome ex: "190" → "COREIA DO SUL"
+_CACHE_RECINTOS: dict[str, str] = {}   # codigo_str → nome ex: "8911101" → "AEROPORTO..."
+_tabelas_lock = threading.Lock()
+_tabelas_carregadas = False
+
+
+def _garantir_tabelas(client) -> None:
+    """Carrega tabelas TABX de países e recintos se ainda não carregadas."""
+    global _tabelas_carregadas
+    with _tabelas_lock:
+        if _tabelas_carregadas:
+            return
+
+        # Países — possíveis nomes de tabela no TABX
+        for nome_pais in ("PAIS", "PAISES", "PAIS_BACEN"):
+            try:
+                registros = client.consultar_tabela_comex(nome_pais)
+                if not registros:
+                    continue
+                # detecta os campos automaticamente (CODIGO/codigo, NOME/nome/DESCRICAO)
+                for r in registros:
+                    codigo = (r.get("CODIGO") or r.get("codigo") or
+                              r.get("CODIGO_PAIS") or r.get("codigo_pais", ""))
+                    nome   = (r.get("NOME") or r.get("nome") or
+                              r.get("DESCRICAO") or r.get("descricao", ""))
+                    if codigo and nome:
+                        _CACHE_PAISES[str(codigo).strip()] = nome.strip()
+                if _CACHE_PAISES:
+                    logger.info("TABX: %d países carregados da tabela '%s'.", len(_CACHE_PAISES), nome_pais)
+                    break
+            except Exception as exc:
+                logger.debug("TABX %s: %s", nome_pais, exc)
+
+        if not _CACHE_PAISES:
+            logger.warning("TABX: tabela de países não encontrada — pais_destino mostrará o código numérico.")
+
+        # Recintos — possíveis nomes de tabela
+        for nome_rec in ("RECINTO_ADUANEIRO", "RECINTO", "RECINTO_ALFANDEGADO"):
+            try:
+                registros = client.consultar_tabela_comex(nome_rec)
+                if not registros:
+                    continue
+                for r in registros:
+                    codigo = (r.get("CODIGO") or r.get("codigo") or
+                              r.get("CODIGO_RECINTO") or r.get("codigo_recinto", ""))
+                    nome   = (r.get("NOME") or r.get("nome") or
+                              r.get("DESCRICAO") or r.get("descricao", ""))
+                    if codigo and nome:
+                        _CACHE_RECINTOS[str(codigo).strip()] = nome.strip()
+                if _CACHE_RECINTOS:
+                    logger.info("TABX: %d recintos carregados da tabela '%s'.", len(_CACHE_RECINTOS), nome_rec)
+                    break
+            except Exception as exc:
+                logger.debug("TABX %s: %s", nome_rec, exc)
+
+        if not _CACHE_RECINTOS:
+            logger.warning("TABX: tabela de recintos não encontrada — porto_embarque mostrará o código.")
+
+        _tabelas_carregadas = True
+
 
 @app.route("/relatorio/enviar", methods=["GET", "POST"])
 def enviar_relatorio_agora():
@@ -220,6 +283,14 @@ def enviar_relatorio_agora():
         try:
             from relatorio_semanal import gerar_e_enviar_relatorio_semanal
             gerar_e_enviar_relatorio_semanal()
+        except Exception as exc:
+            logger.error("Relatório semanal falhou com exceção não tratada: %s", exc, exc_info=True)
+            try:
+                notificar_falha_webhook(
+                    f"Relatório semanal falhou com erro crítico:\n\n{exc}\n\nVerifique os logs do container."
+                )
+            except Exception as email_exc:
+                logger.error("Não foi possível enviar alerta de falha do relatório: %s", email_exc)
         finally:
             _relatorio_lock.release()
 
@@ -404,6 +475,8 @@ def _consultar_e_enriquecer_due(numero: str, due_id: int) -> None:
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
                 logger.error("DUE %s: autenticação falhou para consulta de detalhe.", numero)
                 return
+            _garantir_tabelas(client)
+
             detalhe = client.consultar_due(numero)
             if not detalhe:
                 logger.warning("DUE %s: detalhe não disponível via API.", numero)
@@ -504,11 +577,13 @@ def _extrair_campos_due(detalhe: dict) -> dict:
         fob = 0.0
 
     # País destino — listaPaisDestino só retorna {"codigo": N}, sem nome
-    # Extrai de enderecoImportador: "...EXTERIOR - NOME DO PAÍS"
+    # 1) Tenta no cache TABX, 2) enderecoImportador, 3) paisImportador.nome
     pais = ""
     paises_lista = primeiro.get("listaPaisDestino") or []
     if paises_lista and isinstance(paises_lista[0], dict):
-        pais = paises_lista[0].get("nome", "")
+        codigo_pais = str(paises_lista[0].get("codigo", "")).strip()
+        pais = (_CACHE_PAISES.get(codigo_pais)
+                or paises_lista[0].get("nome", ""))
     if not pais:
         endereco = primeiro.get("enderecoImportador", "")
         if "EXTERIOR - " in endereco:
@@ -518,10 +593,13 @@ def _extrair_campos_due(detalhe: dict) -> dict:
         pais = pais_imp.get("nome", "") if isinstance(pais_imp, dict) else ""
 
     # Porto de embarque — recintoAduaneiroDeEmbarque só retorna {"codigo": "..."}, sem descricao
-    # Usa o código como fallback
+    # 1) Tenta no cache TABX, 2) .descricao, 3) código bruto
     recinto_emb = detalhe.get("recintoAduaneiroDeEmbarque") or {}
     if isinstance(recinto_emb, dict):
-        porto = recinto_emb.get("descricao") or recinto_emb.get("codigo", "")
+        codigo_recinto = str(recinto_emb.get("codigo", "")).strip()
+        porto = (recinto_emb.get("descricao")
+                 or _CACHE_RECINTOS.get(codigo_recinto)
+                 or codigo_recinto)
     else:
         porto = ""
 

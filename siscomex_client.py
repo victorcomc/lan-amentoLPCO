@@ -150,6 +150,9 @@ class SiscomexClient:
     _LPCO_HISTORICO         = "/talpco/api/ext/lpco/{numero}/historico"
     _LPCO_SITUACAO          = "/talpco/api/ext/lpco/situacao/{numero}"
 
+    # Endpoint TABX (Tabelas Comex) — lookup de países, recintos, etc.
+    _TABX_TABELA = "/tabx/api/ext/tabela/{nome}"
+
     def __init__(
         self,
         cert_pfx_path: str = "",
@@ -414,6 +417,34 @@ class SiscomexClient:
     def historico_lpco(self, numero: str) -> list:
         """GET /talpco/api/ext/lpco/{numero}/historico"""
         return self._get(self._LPCO_HISTORICO.format(numero=numero))  # type: ignore[return-value]
+
+    def consultar_tabela_comex(self, nome_tabela: str) -> list[dict]:
+        """
+        Consulta dados de uma tabela TABX (Tabelas Comex).
+        Retorna lista de dicts campo→valor por registro, ex:
+          [{"CODIGO": "076", "NOME": "BRASIL"}, ...]
+        """
+        import json as _json
+        path = self._TABX_TABELA.format(nome=nome_tabela)
+        try:
+            resp = self._get(path, timeout=self._TIMEOUT_DATA)
+        except Exception as exc:
+            logger.warning("TABX %s: falha na consulta — %s", nome_tabela, exc)
+            return []
+
+        dados = resp.get("dados", []) if isinstance(resp, dict) else []
+        resultado = []
+        for registro in dados:
+            campos_dict: dict = {}
+            for campo in registro.get("campos", []):
+                nome = campo.get("nome", "")
+                valor = campo.get("valor", "")
+                if nome:
+                    campos_dict[nome] = valor
+            if campos_dict:
+                resultado.append(campos_dict)
+        logger.info("TABX %s: %d registros carregados.", nome_tabela, len(resultado))
+        return resultado
 
     def consultar_due(self, numero: str) -> dict:
         """

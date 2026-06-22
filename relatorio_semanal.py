@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _DELAY_ENTRE_CHAMADAS = 0.2   # entre páginas da consulta
 _TAMANHO_PAGINA = 100         # itens por página (reduz número de round-trips)
 _WORKERS_DETALHE = 5          # chamadas paralelas ao detalhar_lpco
+_MAX_PAGINAS = 200            # limite de segurança: 200 × 100 = 20.000 LPCOs máximo
 
 _CORES_SITUACAO = {
     "DEFERIDO":         "C6EFCE",
@@ -168,12 +169,14 @@ def _paginar_filtrado_por_cnpj(
                         # Sem CNPJ no item da lista — precisa detalhar para saber
                         incertos.append(record.numero)
 
-                if pagina % 5 == 0:
-                    logger.info(
-                        "%s: pág. %d — %d total, %d clientes, %d incertos",
-                        label, pagina, total_api, len(numeros_cliente), len(incertos),
-                    )
+                logger.info(
+                    "%s: pág. %d — %d total, %d clientes, %d incertos",
+                    label, pagina, total_api, len(numeros_cliente), len(incertos),
+                )
                 if len(resultado.registros) < _TAMANHO_PAGINA:
+                    break
+                if pagina >= _MAX_PAGINAS:
+                    logger.warning("%s: limite de %d páginas atingido — parando paginação.", label, _MAX_PAGINAS)
                     break
                 pagina += 1
                 time.sleep(_DELAY_ENTRE_CHAMADAS)
@@ -1099,9 +1102,15 @@ def gerar_e_enviar_relatorio_semanal() -> None:
     periodo = f"{inicio.strftime('%d/%m/%Y')} a {agora.strftime('%d/%m/%Y')}"
     nome    = f"relatorio_mercado_{agora.strftime('%Y-%m-%d')}.xlsx"
 
+    from email_service import notificar_falha_webhook
+    t0 = time.time()
     logger.info("=== Relatório semanal iniciando — período: %s ===", periodo)
 
+    def _elapsed() -> str:
+        return f"{time.time() - t0:.0f}s"
+
     # 1. LPCOs dos clientes — pagina API completa e filtra por CNPJ antes de chamar detalhe
+    logger.info("[%s] Etapa 1/4: buscando LPCOs dos clientes...", _elapsed())
     detalhes, stats_lpco = _buscar_lpcos_clientes()
 
     conhecidos = set(listar_lpcos_conhecidos())
@@ -1112,39 +1121,51 @@ def gerar_e_enviar_relatorio_semanal() -> None:
         dados_lpco.append(campos)
 
     logger.info(
-        "LPCOs de clientes: %d total — %d nossos (SharePoint) / %d novos.",
-        stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), stats_lpco.get("novos", 0),
+        "[%s] LPCOs de clientes: %d total — %d nossos (SharePoint) / %d novos.",
+        _elapsed(), stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), stats_lpco.get("novos", 0),
     )
 
     # 2a. DUEs do banco (capturadas via webhook no período)
+    logger.info("[%s] Etapa 2/4: buscando DUEs do banco...", _elapsed())
     dues_webhook = listar_dues(
         data_inicio=inicio.strftime("%Y-%m-%d"),
         data_fim=agora.strftime("%Y-%m-%d"),
     )
-    logger.info("DUEs via webhook (período): %d", len(dues_webhook))
+    logger.info("[%s] DUEs via webhook (período): %d", _elapsed(), len(dues_webhook))
 
     # 2b. DUEs vinculadas diretamente aos LPCOs dos clientes (via campo numero_di_due)
     dues_lpco = _buscar_dues_dos_lpcos(dados_lpco)
-    logger.info("DUEs via LPCOs de clientes: %d", len(dues_lpco))
+    logger.info("[%s] DUEs via LPCOs de clientes: %d", _elapsed(), len(dues_lpco))
 
     # Merge sem duplicatas (webhook tem prioridade — dados já enriquecidos)
     numeros_webhook = {d["numero_due"] for d in dues_webhook}
     dues_extras = [d for d in dues_lpco if d["numero_due"] not in numeros_webhook]
     dues = dues_webhook + dues_extras
-    logger.info("DUEs total no relatório: %d (%d webhook + %d via LPCO)", len(dues), len(dues_webhook), len(dues_extras))
+    logger.info("[%s] DUEs total no relatório: %d (%d webhook + %d via LPCO)", _elapsed(), len(dues), len(dues_webhook), len(dues_extras))
 
     if not dados_lpco and not dues:
-        logger.error("Sem dados para o relatório — cancelado.")
+        msg = f"Sem dados para o relatório (período: {periodo}) — nenhum LPCO de cliente encontrado e nenhuma DUE no banco."
+        logger.error(msg)
+        try:
+            notificar_falha_webhook(msg)
+        except Exception:
+            pass
         return
 
     # 3. Gera Excel
+    logger.info("[%s] Etapa 3/4: gerando Excel...", _elapsed())
     try:
         excel_bytes = _gerar_excel_completo(dados_lpco, dues, periodo)
     except Exception as exc:
-        logger.error("Erro ao gerar Excel: %s", exc)
+        logger.error("[%s] Erro ao gerar Excel: %s", _elapsed(), exc, exc_info=True)
+        try:
+            notificar_falha_webhook(f"Relatório semanal: erro ao gerar Excel — {exc}")
+        except Exception:
+            pass
         return
 
     # 4. Envia por email com resumo no corpo
+    logger.info("[%s] Etapa 4/4: enviando email...", _elapsed())
     resumo = (
         f"Período: {periodo}\n"
         f"LPCOs de clientes: {stats_lpco.get('total', 0)} "
@@ -1156,6 +1177,10 @@ def gerar_e_enviar_relatorio_semanal() -> None:
     )
     try:
         enviar_relatorio_excel(excel_bytes, nome, periodo, resumo_extra=resumo)
-        logger.info("=== Relatório enviado: %s ===", nome)
+        logger.info("=== [%s] Relatório enviado: %s ===", _elapsed(), nome)
     except Exception as exc:
-        logger.error("Erro ao enviar relatório: %s", exc)
+        logger.error("[%s] Erro ao enviar email do relatório: %s", _elapsed(), exc, exc_info=True)
+        try:
+            notificar_falha_webhook(f"Relatório semanal gerado mas falhou ao enviar email: {exc}")
+        except Exception:
+            pass
