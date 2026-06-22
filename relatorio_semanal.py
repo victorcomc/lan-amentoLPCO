@@ -1069,15 +1069,18 @@ def gerar_e_enviar_relatorio_semanal() -> None:
     detalhes, stats_lpco = _buscar_lpcos_clientes(data_inicio=lpco_inicio.strftime("%Y-%m-%d"))
 
     conhecidos = set(listar_lpcos_conhecidos())
-    dados_lpco: list[dict] = []
+    dados_lpco_todos: list[dict] = []
     for num, raw in detalhes.items():
         campos = _extrair_campos(num, raw)
         campos["em_sharepoint"] = num in conhecidos
-        dados_lpco.append(campos)
+        dados_lpco_todos.append(campos)
+
+    # Relatório de mercado: apenas LPCOs que não estamos trabalhando (não estão no SharePoint)
+    dados_lpco = [d for d in dados_lpco_todos if not d.get("em_sharepoint")]
 
     logger.info(
-        "[%s] LPCOs de clientes: %d total — %d nossos (SharePoint) / %d novos.",
-        _elapsed(), stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), stats_lpco.get("novos", 0),
+        "[%s] LPCOs de clientes: %d total — %d já no SharePoint (ignorados) / %d novos (no relatório).",
+        _elapsed(), stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), len(dados_lpco),
     )
 
     # 2a. DUEs do banco (capturadas via webhook no período)

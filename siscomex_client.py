@@ -206,6 +206,8 @@ class SiscomexClient:
         logger.debug("GET %s params=%s", url, params)
         response = self._session.get(url, params=params, timeout=timeout or self._TIMEOUT)
         response.raise_for_status()
+        if not response.content or response.status_code == 204:
+            return []
         return response.json()
 
     def _delete(self, path: str) -> None:
@@ -410,6 +412,11 @@ class SiscomexClient:
             return PollingResult(sucesso=True, timestamp=timestamp, registros=registros)
 
         except requests.HTTPError as exc:
+            # 422 PUCX-ER0102: CNPJ fora da jurisdição deste certificado — resultado vazio esperado
+            if exc.response.status_code == 422 and "PUCX-ER0102" in exc.response.text:
+                cnpj = params.get("importador-exportador", "?")
+                logger.debug("buscar_lpcos cnpj=%s: fora da jurisdição do certificado (422), ignorado.", cnpj)
+                return PollingResult(sucesso=True, timestamp=timestamp, registros=[])
             msg = f"HTTP {exc.response.status_code}: {exc.response.text[:300]}"
             logger.error("Erro no polling: %s", msg)
             return PollingResult(sucesso=False, timestamp=timestamp, erro=msg)
