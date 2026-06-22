@@ -95,49 +95,19 @@ def _detalhar_lista(numeros: list[str], label: str, pfx_path: str, pfx_base64: s
     return resultado
 
 
-def _cnpj_do_item_lista(raw_item: dict) -> str:
-    """Extrai CNPJ do item bruto da lista /consulta (sem precisar chamar /detalhe)."""
-    candidatos = [
-        "cpfCnpj", "cnpj", "cpf",
-        "cpfCnpjRequerente", "cnpjRequerente",
-        "cpfCnpjDeclarante", "cnpjDeclarante",
-        "cpfCnpjExportador", "cnpjExportador",
-    ]
-    for campo in candidatos:
-        val = raw_item.get(campo)
-        if val and isinstance(val, str):
-            return "".join(c for c in val if c.isdigit())
-
-    # Tenta dentro de objetos aninhados comuns no item de lista
-    for obj_campo in ("requerente", "exportador", "declarante", "importador", "solicitante"):
-        obj = raw_item.get(obj_campo)
-        if isinstance(obj, dict):
-            for campo in candidatos:
-                val = obj.get(campo)
-                if val and isinstance(val, str):
-                    return "".join(c for c in val if c.isdigit())
-    return ""
-
-
-def _paginar_filtrado_por_cnpj(
+def _buscar_lpcos_por_cnpj(
     cnpjs_clientes: set[str],
     label: str,
     pfx_path: str, pfx_base64: str, pfx_password: str,
 ) -> set[str]:
     """
-    Pagina TODOS os LPCOs via /consulta e filtra pelos CNPJs de clientes
-    usando o item da lista (sem chamar detalhe para cada um).
-
-    Estratégia de filtro por ordem de confiança:
-    1. CNPJ encontrado no item da lista → filtra imediatamente (rápido)
-    2. CNPJ não encontrado no item → inclui na lista "incertos" para detalhar depois
+    Busca LPCOs de cada cliente individualmente usando o filtro cpfCnpj da API.
+    Uma chamada por CNPJ — retorna só os LPCOs daquele cliente.
+    Muito mais rápido que paginar todos os LPCOs da API.
     """
-    numeros_cliente: set[str] = set()
-    incertos: list[str] = []
-    total_api = 0
-
-    if not (pfx_path or pfx_base64):
-        return numeros_cliente
+    numeros: set[str] = set()
+    if not cnpjs_clientes or not (pfx_path or pfx_base64):
+        return numeros
     try:
         with SiscomexClient(
             cert_pfx_path=pfx_path,
@@ -146,65 +116,41 @@ def _paginar_filtrado_por_cnpj(
         ) as client:
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
                 logger.error("Autenticação %s falhou.", label)
-                return numeros_cliente
+                return numeros
 
-            pagina = 1
-            while True:
-                resultado = client.buscar_lpcos(pagina=pagina, tamanho=_TAMANHO_PAGINA)
-                if not resultado.sucesso or not resultado.registros:
-                    if pagina == 1 and not resultado.sucesso:
-                        logger.warning("%s: falha na paginação — %s", label, resultado.erro)
-                    break
+            lista_cnpjs = sorted(cnpjs_clientes)
+            for i, cnpj in enumerate(lista_cnpjs, 1):
+                total_cnpj = 0
+                pagina = 1
+                while True:
+                    resultado = client.buscar_lpcos(
+                        cpf_cnpj=cnpj, pagina=pagina, tamanho=_TAMANHO_PAGINA
+                    )
+                    if not resultado.sucesso or not resultado.registros:
+                        break
+                    for record in resultado.registros:
+                        if record.numero:
+                            numeros.add(record.numero)
+                            total_cnpj += 1
+                    if len(resultado.registros) < _TAMANHO_PAGINA:
+                        break
+                    pagina += 1
+                    time.sleep(_DELAY_ENTRE_CHAMADAS)
 
-                for record in resultado.registros:
-                    if not record.numero:
-                        continue
-                    total_api += 1
-                    cnpj = _cnpj_do_item_lista(record.raw)
-                    if cnpj:
-                        if cnpj in cnpjs_clientes:
-                            numeros_cliente.add(record.numero)
-                        # else: não é cliente, descarta sem chamar detail
-                    else:
-                        # Sem CNPJ no item da lista — precisa detalhar para saber
-                        incertos.append(record.numero)
-
-                logger.info(
-                    "%s: pág. %d — %d total, %d clientes, %d incertos",
-                    label, pagina, total_api, len(numeros_cliente), len(incertos),
-                )
-                if len(resultado.registros) < _TAMANHO_PAGINA:
-                    break
-                if pagina >= _MAX_PAGINAS:
-                    logger.warning("%s: limite de %d páginas atingido — parando paginação.", label, _MAX_PAGINAS)
-                    break
-                pagina += 1
-                time.sleep(_DELAY_ENTRE_CHAMADAS)
+                if total_cnpj:
+                    logger.info(
+                        "%s: [%d/%d] CNPJ %s — %d LPCOs",
+                        label, i, len(lista_cnpjs), cnpj, total_cnpj,
+                    )
 
         logger.info(
-            "%s: paginação concluída — %d total, %d clientes (lista), %d incertos",
-            label, total_api, len(numeros_cliente), len(incertos),
+            "%s: concluído — %d LPCOs encontrados para %d CNPJs de clientes.",
+            label, len(numeros), len(cnpjs_clientes),
         )
-
-        # Resolve incertos: detalha e checa CNPJ
-        if incertos:
-            logger.info("%s: resolvendo %d LPCOs sem CNPJ na lista via detalhe.", label, len(incertos))
-            detalhes_incertos = _detalhar_lista(
-                incertos, f"{label}-incertos", pfx_path, pfx_base64, pfx_password,
-            )
-            resolvidos = 0
-            for numero, raw in detalhes_incertos.items():
-                campos = _extrair_campos(numero, raw)
-                cnpj = "".join(c for c in (campos.get("cnpj") or "") if c.isdigit())
-                if cnpj in cnpjs_clientes:
-                    numeros_cliente.add(numero)
-                    resolvidos += 1
-            logger.info("%s: %d/%d incertos eram clientes.", label, resolvidos, len(incertos))
-
     except Exception as exc:
         logger.error("Erro na sessão %s: %s", label, exc)
 
-    return numeros_cliente
+    return numeros
 
 
 def _buscar_lpcos_clientes() -> tuple[dict[str, dict], dict]:
@@ -229,14 +175,14 @@ def _buscar_lpcos_clientes() -> tuple[dict[str, dict], dict]:
         len(cnpjs), len(conhecidos),
     )
 
-    # 1. Pagina e filtra por CNPJ usando o item da lista
-    numeros_se = _paginar_filtrado_por_cnpj(
+    # 1. Busca LPCOs por CNPJ de cada cliente (uma chamada por CNPJ)
+    numeros_se = _buscar_lpcos_por_cnpj(
         cnpjs, "SE",
         config.CERT_PFX_PATH, config.CERT_PFX_BASE64, config.CERT_PFX_PASSWORD,
     )
     numeros_ne: set[str] = set()
     if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
-        numeros_ne = _paginar_filtrado_por_cnpj(
+        numeros_ne = _buscar_lpcos_por_cnpj(
             cnpjs, "NE",
             config.CERT_NE_PFX_PATH, config.CERT_NE_PFX_BASE64, config.CERT_NE_PFX_PASSWORD,
         )
