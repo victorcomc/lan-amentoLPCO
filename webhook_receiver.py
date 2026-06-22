@@ -613,7 +613,8 @@ def _extrair_campos_due(detalhe: dict) -> dict:
         "pais_destino":    pais,
         "porto_embarque":  porto,
         "situacao_due":    detalhe.get("situacao", ""),
-        "data_averbacao":  detalhe.get("dataDaAverbacao", ""),
+        "data_averbacao":  (detalhe.get("dataDaAverbacao")
+                            or detalhe.get("dataDoDesembaraco", "")),
         "canal_due":       detalhe.get("canal", ""),
     }
 

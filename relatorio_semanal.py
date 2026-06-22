@@ -100,16 +100,14 @@ def _buscar_lpcos_por_cnpj(
     label: str,
     pfx_path: str, pfx_base64: str, pfx_password: str,
     data_inicio: str = "",
-) -> set[str]:
+) -> dict[str, str]:
     """
     Busca LPCOs de cada cliente usando o parâmetro 'importador-exportador' da API.
-    Uma chamada por CNPJ — retorna só os LPCOs daquele cliente.
-    Paginação via offset (a API TALPCO não aceita tamanhoPagina).
-    data_inicio: filtro de data de registro (YYYY-MM-DD), evita puxar histórico inteiro.
+    Retorna dict {numero_lpco: cnpj_cliente} para preservar a associação.
     """
-    numeros: set[str] = set()
+    mapa: dict[str, str] = {}  # numero → cnpj
     if not cnpjs_clientes or not (pfx_path or pfx_base64):
-        return numeros
+        return mapa
     try:
         with SiscomexClient(
             cert_pfx_path=pfx_path,
@@ -118,7 +116,7 @@ def _buscar_lpcos_por_cnpj(
         ) as client:
             if not client.autenticar(config.WEBHOOK_ROLE_TYPE):
                 logger.error("Autenticação %s falhou.", label)
-                return numeros
+                return mapa
 
             lista_cnpjs = sorted(cnpjs_clientes)
             for i, cnpj in enumerate(lista_cnpjs, 1):
@@ -134,8 +132,8 @@ def _buscar_lpcos_por_cnpj(
                     if not resultado.sucesso or not resultado.registros:
                         break
                     for record in resultado.registros:
-                        if record.numero:
-                            numeros.add(record.numero)
+                        if record.numero and record.numero not in mapa:
+                            mapa[record.numero] = cnpj
                             total_cnpj += 1
                     offset += len(resultado.registros)
                     if offset > 5000:
@@ -151,12 +149,12 @@ def _buscar_lpcos_por_cnpj(
 
         logger.info(
             "%s: concluído — %d LPCOs encontrados para %d CNPJs de clientes.",
-            label, len(numeros), len(cnpjs_clientes),
+            label, len(mapa), len(cnpjs_clientes),
         )
     except Exception as exc:
         logger.error("Erro na sessão %s: %s", label, exc)
 
-    return numeros
+    return mapa
 
 
 def _buscar_lpcos_clientes(data_inicio: str = "") -> tuple[dict[str, dict], dict]:
@@ -182,21 +180,24 @@ def _buscar_lpcos_clientes(data_inicio: str = "") -> tuple[dict[str, dict], dict
     )
 
     # 1. Busca LPCOs por CNPJ de cada cliente (uma chamada por CNPJ)
-    numeros_se = _buscar_lpcos_por_cnpj(
+    #    Retorna dict {numero_lpco: cnpj_cliente} para preservar a associação
+    mapa_se = _buscar_lpcos_por_cnpj(
         cnpjs, "SE",
         config.CERT_PFX_PATH, config.CERT_PFX_BASE64, config.CERT_PFX_PASSWORD,
         data_inicio=data_inicio,
     )
-    numeros_ne: set[str] = set()
+    mapa_ne: dict[str, str] = {}
     if config.CERT_NE_PFX_BASE64 or config.CERT_NE_PFX_PATH:
-        numeros_ne = _buscar_lpcos_por_cnpj(
+        mapa_ne = _buscar_lpcos_por_cnpj(
             cnpjs, "NE",
             config.CERT_NE_PFX_PATH, config.CERT_NE_PFX_BASE64, config.CERT_NE_PFX_PASSWORD,
             data_inicio=data_inicio,
         )
 
-    todos_numeros = list(numeros_se | numeros_ne)
-    logger.info("Total de LPCOs de clientes encontrados: %d (SE: %d, NE: %d)", len(todos_numeros), len(numeros_se), len(numeros_ne))
+    # Merge: SE tem prioridade; NE adiciona LPCOs que SE não retornou
+    mapa_todos: dict[str, str] = {**mapa_ne, **mapa_se}
+    todos_numeros = list(mapa_todos.keys())
+    logger.info("Total de LPCOs de clientes encontrados: %d (SE: %d, NE: %d)", len(mapa_todos), len(mapa_se), len(mapa_ne))
 
     if not todos_numeros:
         logger.warning("Nenhum LPCO de cliente encontrado na API.")
@@ -215,6 +216,15 @@ def _buscar_lpcos_clientes(data_inicio: str = "") -> tuple[dict[str, dict], dict
                 config.CERT_NE_PFX_PATH, config.CERT_NE_PFX_BASE64, config.CERT_NE_PFX_PASSWORD,
             )
             detalhes.update(ne_detalhe)
+
+    # Injeta o CNPJ que usamos na busca dentro do raw dict — garante que _extrair_campos() encontre
+    primeiros_keys_logados = False
+    for num, raw in detalhes.items():
+        if isinstance(raw, dict):
+            raw["_cnpj_cliente"] = mapa_todos.get(num, "")
+            if not primeiros_keys_logados and raw:
+                logger.info("LPCO %s — chaves do detalhe API: %s", num, sorted(raw.keys()))
+                primeiros_keys_logados = True
 
     # 3. Stats: nossos (em lpcos_conhecidos) vs novos (não registrados ainda)
     nossos = sum(1 for n in todos_numeros if n in conhecidos)
@@ -236,6 +246,21 @@ def _buscar_lpcos_clientes(data_inicio: str = "") -> tuple[dict[str, dict], dict
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
+
+def _nome_importador_due(d: dict) -> str:
+    """Extrai nomeImportador do detalhe_json armazenado no banco."""
+    raw = d.get("detalhe_json")
+    if not raw:
+        return ""
+    try:
+        detalhe = json.loads(raw)
+        itens = detalhe.get("itens") or []
+        if itens:
+            return itens[0].get("nomeImportador", "")
+    except Exception:
+        pass
+    return ""
+
 
 def _get_nested(raw: dict, *chaves: str) -> Any:
     for chave in chaves:
@@ -265,13 +290,15 @@ def _extrair_campos(numero: str, raw: dict) -> dict:
     orgao_obj      = raw.get("orgaoAnuente") or raw.get("orgao") or {}
     transporte_obj = raw.get("modoTransporte") or raw.get("transporte") or {}
 
+    # _cnpj_cliente é injetado por _buscar_lpcos_clientes() — sempre confiável
     cnpj = (
+        raw.get("_cnpj_cliente") or
         _get_nested(requerente, "cpfCnpj", "cnpj", "cpf") or
-        _get_nested(raw, "cpfCnpj", "cnpj")
+        _get_nested(raw, "cpfCnpj", "cnpj", "cpfCnpjRequerente")
     )
     nome = (
         _get_nested(requerente, "nome", "razaoSocial", "nomeEmpresa") or
-        _get_nested(raw, "nomeRequerente", "nomeEmpresa")
+        _get_nested(raw, "nomeRequerente", "nomeEmpresa", "razaoSocialRequerente")
     )
 
     quantidade_raw = (
@@ -735,12 +762,13 @@ def _aba_resumo_dues(wb: Any, dues: list[dict]) -> None:
 def _aba_detalhe_dues(wb: Any, dues: list[dict]) -> None:
     ws = wb.create_sheet("Detalhe DUEs")
     _aplicar_cabecalho(ws, [
-        "Número DUE", "Data Averbação", "Data Evento", "Data Recebido",
+        "Número DUE", "Data Desembaraço", "Data Evento", "Data Recebido",
         "Situação DUE", "Canal", "Tipo Evento", "Descrição do Evento",
         "Exportador CNPJ", "Exportador Nome",
         "NCM", "Produto / Espécie",
         "Peso Líquido (kg)", "Peso Bruto (kg)", "Valor FOB (USD)",
         "País Destino", "Porto Embarque", "Embarcação",
+        "Nome Importador",
         "RUC",
     ], cor_hex="375623")
 
@@ -764,6 +792,7 @@ def _aba_detalhe_dues(wb: Any, dues: list[dict]) -> None:
             d.get("pais_destino", ""),
             d.get("porto_embarque", ""),
             d.get("embarcacao", ""),
+            _nome_importador_due(d),
             d.get("ruc", ""),
         ])
 
@@ -1083,13 +1112,18 @@ def gerar_e_enviar_relatorio_semanal() -> None:
         _elapsed(), stats_lpco.get("total", 0), stats_lpco.get("nossos", 0), len(dados_lpco),
     )
 
-    # 2a. DUEs do banco (capturadas via webhook no período)
+    # 2a. DUEs do banco (capturadas via webhook no período) — filtradas pelos CNPJs dos clientes
     logger.info("[%s] Etapa 2/4: buscando DUEs do banco...", _elapsed())
-    dues_webhook = listar_dues(
+    dues_webhook_todas = listar_dues(
         data_inicio=inicio.strftime("%Y-%m-%d"),
         data_fim=agora.strftime("%Y-%m-%d"),
     )
-    logger.info("[%s] DUEs via webhook (período): %d", _elapsed(), len(dues_webhook))
+    cnpjs_clientes_set = listar_cnpjs_clientes()
+    dues_webhook = [d for d in dues_webhook_todas if d.get("exportador_cnpj") in cnpjs_clientes_set]
+    logger.info(
+        "[%s] DUEs via webhook: %d total no banco / %d dos CNPJs de clientes",
+        _elapsed(), len(dues_webhook_todas), len(dues_webhook),
+    )
 
     # 2b. DUEs vinculadas diretamente aos LPCOs dos clientes (via campo numero_di_due)
     dues_lpco = _buscar_dues_dos_lpcos(dados_lpco)
