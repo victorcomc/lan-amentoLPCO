@@ -362,30 +362,36 @@ class SiscomexClient:
         data_inicio: str | None = None,
         data_fim: str | None = None,
         cpf_cnpj: str | None = None,
+        tipo_operacao: str = "EXPORTACAO",
+        codigo_modelo: str | None = None,
+        offset: int = 0,
+        # mantidos por compatibilidade, ignorados pela API
         pagina: int = 1,
         tamanho: int = 10,
     ) -> PollingResult:
         """
         Consulta LPCOs via GET /talpco/api/ext/lpco/consulta.
 
-        Parâmetros opcionais:
-          situacao     — filtro de situação (ex: "DEFERIDO", "EM_ANALISE")
-          data_inicio  — formato YYYY-MM-DD
-          data_fim     — formato YYYY-MM-DD
-          cpf_cnpj     — CPF ou CNPJ do requerente (só dígitos)
-          pagina       — página (default 1)
-          tamanho      — itens por página (default 10; servidor TALPCO é lento com valores altos)
+        Parâmetros da API (nomes exatos do Swagger):
+          tipo-operacao        — obrigatório: EXPORTACAO ou IMPORTACAO
+          importador-exportador — CPF/CNPJ do exportador/importador
+          situacao             — ex: DEFERIDO, EM_ANALISE
+          data-inicial-registro / data-final-registro — YYYY-MM-DD
+          codigo-modelo        — ex: E00061 (Pesca), E00144 (Fruta)
+          offset               — paginação (a API não aceita page size)
         """
         timestamp = datetime.now()
-        params: dict = {"pagina": pagina, "tamanhoPagina": tamanho}
+        params: dict = {"tipo-operacao": tipo_operacao, "offset": offset}
         if situacao:
             params["situacao"] = situacao
         if data_inicio:
-            params["dataInicio"] = data_inicio
+            params["data-inicial-registro"] = data_inicio
         if data_fim:
-            params["dataFim"] = data_fim
+            params["data-final-registro"] = data_fim
         if cpf_cnpj:
-            params["cpfCnpj"] = cpf_cnpj
+            params["importador-exportador"] = cpf_cnpj
+        if codigo_modelo:
+            params["codigo-modelo"] = codigo_modelo
 
         try:
             dados = self._get(self._LPCO_CONSULTA, params=params, timeout=self._TIMEOUT_DATA)

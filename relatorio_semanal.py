@@ -101,9 +101,9 @@ def _buscar_lpcos_por_cnpj(
     pfx_path: str, pfx_base64: str, pfx_password: str,
 ) -> set[str]:
     """
-    Busca LPCOs de cada cliente individualmente usando o filtro cpfCnpj da API.
+    Busca LPCOs de cada cliente usando o parâmetro 'importador-exportador' da API.
     Uma chamada por CNPJ — retorna só os LPCOs daquele cliente.
-    Muito mais rápido que paginar todos os LPCOs da API.
+    Paginação via offset (a API TALPCO não aceita tamanhoPagina).
     """
     numeros: set[str] = set()
     if not cnpjs_clientes or not (pfx_path or pfx_base64):
@@ -121,10 +121,12 @@ def _buscar_lpcos_por_cnpj(
             lista_cnpjs = sorted(cnpjs_clientes)
             for i, cnpj in enumerate(lista_cnpjs, 1):
                 total_cnpj = 0
-                pagina = 1
+                offset = 0
                 while True:
                     resultado = client.buscar_lpcos(
-                        cpf_cnpj=cnpj, pagina=pagina, tamanho=_TAMANHO_PAGINA
+                        cpf_cnpj=cnpj,
+                        tipo_operacao="EXPORTACAO",
+                        offset=offset,
                     )
                     if not resultado.sucesso or not resultado.registros:
                         break
@@ -132,9 +134,10 @@ def _buscar_lpcos_por_cnpj(
                         if record.numero:
                             numeros.add(record.numero)
                             total_cnpj += 1
-                    if len(resultado.registros) < _TAMANHO_PAGINA:
+                    offset += len(resultado.registros)
+                    if offset > 5000:
+                        logger.warning("%s: CNPJ %s atingiu 5000 LPCOs, interrompendo.", label, cnpj)
                         break
-                    pagina += 1
                     time.sleep(_DELAY_ENTRE_CHAMADAS)
 
                 if total_cnpj:
