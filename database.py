@@ -288,16 +288,17 @@ def atualizar_due_detalhe(due_id: int, campos: dict[str, Any]) -> None:
 
 
 def listar_dues(data_inicio: str = "", data_fim: str = "") -> list[dict]:
-    """Retorna DUEs de mercado ordenadas por data."""
+    """Retorna DUEs de mercado ordenadas por data.
+    Filtra por data_recebido (ISO) pois data_evento pode vir em DD/MM/YYYY."""
     query = "SELECT * FROM dues_mercado WHERE 1=1"
     params: list[str] = []
     if data_inicio:
-        query += " AND data_evento >= ?"
+        query += " AND data_recebido >= ?"
         params.append(data_inicio)
     if data_fim:
-        query += " AND data_evento <= ?"
+        query += " AND data_recebido <= ?"
         params.append(data_fim + " 23:59:59")
-    query += " ORDER BY data_evento ASC"
+    query += " ORDER BY data_recebido ASC"
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, params).fetchall()
