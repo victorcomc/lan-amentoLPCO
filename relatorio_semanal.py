@@ -224,6 +224,17 @@ def _buscar_lpcos_clientes(data_inicio: str = "") -> tuple[dict[str, dict], dict
             raw["_cnpj_cliente"] = mapa_todos.get(num, "")
             if not primeiros_keys_logados and raw:
                 logger.info("LPCO %s — chaves do detalhe API: %s", num, sorted(raw.keys()))
+                for campo in ["importadorExportador", "listaNcm", "saldos"]:
+                    val = raw.get(campo)
+                    if val is not None:
+                        logger.info("LPCO %s — %s: %s", num, campo,
+                                    json.dumps(val, ensure_ascii=False)[:400])
+                campos_form = raw.get("listaCamposFormulario") or []
+                if campos_form:
+                    logger.info("LPCO %s — listaCamposFormulario[0]: %s",
+                                num, json.dumps(campos_form[0], ensure_ascii=False)[:400])
+                    logger.info("LPCO %s — listaCamposFormulario total: %d campos",
+                                num, len(campos_form))
                 primeiros_keys_logados = True
 
     # 3. Stats: nossos (em lpcos_conhecidos) vs novos (não registrados ainda)
@@ -275,96 +286,107 @@ def _get_nested(raw: dict, *chaves: str) -> Any:
     return ""
 
 
-def _extrair_campos(numero: str, raw: dict) -> dict:
-    requerente = (
-        raw.get("requerente") or raw.get("importador") or
-        raw.get("exportador") or raw.get("solicitante") or {}
-    )
-    mercadoria = (
-        raw.get("mercadoria") or raw.get("produto") or
-        raw.get("item") or raw.get("dadosMercadoria") or {}
-    )
-    situacao_obj   = raw.get("situacao") if isinstance(raw.get("situacao"), dict) else {}
-    pais_obj       = raw.get("paisDestino") or raw.get("pais") or raw.get("paisDeDestino") or {}
-    porto_obj      = raw.get("portoEmbarque") or raw.get("porto") or raw.get("localEmbarque") or {}
-    orgao_obj      = raw.get("orgaoAnuente") or raw.get("orgao") or {}
-    transporte_obj = raw.get("modoTransporte") or raw.get("transporte") or {}
+def _extrair_campo_formulario(campos_form: list, *palavras: str) -> str:
+    """Busca em listaCamposFormulario pelo código do campo contendo qualquer das palavras."""
+    for cf in campos_form:
+        if not isinstance(cf, dict):
+            continue
+        campo_obj = cf.get("campo") or {}
+        cod = (
+            (campo_obj.get("codigo") or cf.get("codigoCampo") or cf.get("codigo") or "")
+        ).upper()
+        if any(p in cod for p in palavras):
+            return (
+                cf.get("valorDescricao") or cf.get("descricaoValor") or
+                cf.get("valorTexto") or cf.get("valor") or ""
+            )
+    return ""
 
-    # _cnpj_cliente é injetado por _buscar_lpcos_clientes() — sempre confiável
+
+def _extrair_campos(numero: str, raw: dict) -> dict:
+    # Campos reais confirmados pela API /talpco/api/ext/lpco/{numero}
+    imp_exp     = raw.get("importadorExportador") or {}
+    lista_ncm   = raw.get("listaNcm") or []
+    saldos      = raw.get("saldos") or {}
+    campos_form = raw.get("listaCamposFormulario") or []
+    orgao_obj   = raw.get("orgao") or {}
+    situacao_obj = raw.get("situacao") if isinstance(raw.get("situacao"), dict) else {}
+
+    # CNPJ — _cnpj_cliente é injetado pela busca, sempre confiável
     cnpj = (
         raw.get("_cnpj_cliente") or
-        _get_nested(requerente, "cpfCnpj", "cnpj", "cpf") or
-        _get_nested(raw, "cpfCnpj", "cnpj", "cpfCnpjRequerente")
+        _get_nested(imp_exp, "cpfCnpj", "cnpj", "numero", "numeroDoDocumento") or ""
     )
-    nome = (
-        _get_nested(requerente, "nome", "razaoSocial", "nomeEmpresa") or
-        _get_nested(raw, "nomeRequerente", "nomeEmpresa", "razaoSocialRequerente")
-    )
+    nome = _get_nested(imp_exp, "nome", "razaoSocial", "nomeEmpresa") or ""
+    uf   = _get_nested(imp_exp, "uf", "siglaUf", "estado") or ""
+    mun  = _get_nested(imp_exp, "municipio", "cidade", "nomeMunicipio") or ""
 
-    quantidade_raw = (
-        _get_nested(mercadoria, "quantidadeAutorizada", "quantidade", "qtd") or
-        _get_nested(raw, "quantidadeAutorizada", "quantidade")
-    )
+    # NCM — primeiro da lista
+    ncm_item = lista_ncm[0] if lista_ncm and isinstance(lista_ncm[0], dict) else {}
+    ncm      = _get_nested(ncm_item, "codigo", "codigoNcm") or ""
+    ncm_desc = _get_nested(ncm_item, "descricao", "descricaoNcm") or ""
+
+    # Saldos — quantidades
+    qtd_raw  = _get_nested(saldos, "quantidadeAutorizada", "saldoInicial", "quantidade", "qtdAutorizada")
+    util_raw = _get_nested(saldos, "quantidadeUtilizada", "saldoUtilizado", "qtdUtilizada")
+    sal_raw  = _get_nested(saldos, "saldoAtual", "saldo", "quantidadeSaldo")
+    unidade  = _get_nested(saldos, "unidade", "siglaUnidade") or ""
     try:
-        quantidade = float(quantidade_raw) if quantidade_raw else 0.0
-    except (ValueError, TypeError):
-        quantidade = 0.0
+        quantidade    = float(qtd_raw) if qtd_raw else 0.0
+        qtd_utilizada = float(util_raw) if util_raw else 0.0
+        saldo_val     = float(sal_raw) if sal_raw else (quantidade - qtd_utilizada if qtd_utilizada else None)
+    except (TypeError, ValueError):
+        quantidade = qtd_utilizada = 0.0
+        saldo_val = None
 
-    qtd_utilizada_raw = (
-        _get_nested(mercadoria, "quantidadeUtilizada", "qtdUtilizada") or
-        _get_nested(raw, "quantidadeUtilizada", "qtdUtilizada")
-    )
-    try:
-        qtd_utilizada = float(qtd_utilizada_raw) if qtd_utilizada_raw else 0.0
-    except (ValueError, TypeError):
-        qtd_utilizada = 0.0
+    # listaCamposFormulario — campos dinâmicos (país, porto, produto etc.)
+    pais  = _extrair_campo_formulario(campos_form, "PAIS", "DESTINO", "COUNTRY")
+    porto = _extrair_campo_formulario(campos_form, "PORTO", "EMBARQUE", "RECINTO", "PORT")
+    prod  = _extrair_campo_formulario(campos_form, "PRODUTO", "DESCRICAO", "MERCADORIA", "ESPECIE", "PRODUTO_DESCRICAO") or ncm_desc
+    modal = _extrair_campo_formulario(campos_form, "MODAL", "TRANSPORTE")
+    emb   = _extrair_campo_formulario(campos_form, "EMBARCACAO", "NAVIO", "VESSEL")
 
+    # Situação
     sit_id   = (
         _get_nested(situacao_obj, "id", "codigo") or
         (raw.get("situacao") if isinstance(raw.get("situacao"), str) else "") or ""
     )
     sit_desc = _get_nested(situacao_obj, "descricao", "nome") or ""
 
-    pais_desc    = _get_nested(pais_obj, "descricao", "nome") or (pais_obj if isinstance(pais_obj, str) else "")
-    porto_desc   = _get_nested(porto_obj, "descricao", "nome") or (porto_obj if isinstance(porto_obj, str) else "")
-    orgao_desc   = _get_nested(orgao_obj, "descricao", "nome", "sigla") or (orgao_obj if isinstance(orgao_obj, str) else "")
-    modal_desc   = _get_nested(transporte_obj, "descricao", "nome") or (transporte_obj if isinstance(transporte_obj, str) else "")
+    # Órgão
+    orgao_desc = (
+        _get_nested(orgao_obj, "descricao", "nome", "sigla") or
+        (orgao_obj if isinstance(orgao_obj, str) else "")
+    )
 
-    modelo = _get_nested(raw, "codigoModelo", "modelo", "tipoLpco")
-
-    # Saldo = autorizado - utilizado (se ambos disponíveis)
-    saldo_raw = _get_nested(mercadoria, "saldo", "quantidadeSaldo") or _get_nested(raw, "saldo", "quantidadeSaldo")
-    try:
-        saldo = float(saldo_raw) if saldo_raw else (quantidade - qtd_utilizada if qtd_utilizada else None)
-    except (ValueError, TypeError):
-        saldo = None
+    modelo = raw.get("codigoModelo", "")
 
     return {
         "numero_lpco":        numero,
         "cnpj":               cnpj,
         "nome_empresa":       nome,
-        "uf":                 _get_nested(requerente, "uf", "estado", "siglaUf") or _get_nested(raw, "uf"),
-        "municipio":          _get_nested(requerente, "municipio", "cidade") or _get_nested(raw, "municipio"),
+        "uf":                 uf,
+        "municipio":          mun,
         "codigo_modelo":      modelo,
         "tipo_lpco":          _MODELOS.get(str(modelo), modelo),
         "orgao_anuente":      orgao_desc,
-        "ncm":                _get_nested(mercadoria, "ncm", "codigoNcm") or _get_nested(raw, "ncm", "codigoNcm"),
-        "descricao_produto":  _get_nested(mercadoria, "descricao", "descricaoNcm", "nome") or _get_nested(raw, "descricaoProduto"),
+        "ncm":                ncm,
+        "descricao_produto":  prod,
         "quantidade":         quantidade,
         "qtd_utilizada":      qtd_utilizada,
-        "saldo":              saldo,
-        "unidade":            _get_nested(mercadoria, "unidade", "siglaUnidade") or _get_nested(raw, "unidade"),
-        "pais_destino":       pais_desc,
-        "porto_embarque":     porto_desc,
-        "embarcacao":         _get_nested(raw, "embarcacao", "nomeEmbarcacao", "navio"),
-        "modal_transporte":   modal_desc,
-        "data_emissao":       _get_nested(raw, "dataEmissao", "dataAbertura", "dtEmissao"),
-        "data_validade":      _get_nested(raw, "dataValidade", "validade", "dtValidade"),
+        "saldo":              saldo_val,
+        "unidade":            unidade,
+        "pais_destino":       pais,
+        "porto_embarque":     porto,
+        "embarcacao":         emb,
+        "modal_transporte":   modal,
+        "data_emissao":       raw.get("dataRegistro", ""),
+        "data_validade":      raw.get("dataSituacaoAtual", ""),
         "situacao_id":        sit_id.upper() if sit_id else "",
         "situacao_desc":      sit_desc,
-        "numero_processo":    _get_nested(raw, "numeroProcesso", "processo", "numProcesso"),
-        "numero_di_due":      _get_nested(raw, "numeroDUE", "numeroDI", "numDUE", "numDI"),
-        "em_sharepoint":      False,  # preenchido depois pelo chamador com base em lpcos_conhecidos
+        "numero_processo":    raw.get("chaveAcesso", ""),
+        "numero_di_due":      "",
+        "em_sharepoint":      False,
     }
 
 
